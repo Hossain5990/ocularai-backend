@@ -2,10 +2,10 @@ services:
   - type: web
     name: ocularai-backend
     env: python
-    region: singapore   # Bangladesh এর কাছের region
+    region: singapore
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: PYTHON_VERSION
-        value: 3.10.0
+        value: 3.11.9
