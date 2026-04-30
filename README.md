@@ -27,7 +27,11 @@ https://drive.google.com/file/d/156xcXLRkd4h2CWvBPIjZQ-MYu4RoJS3R/view?usp=shari
 pca.pkl                    →  ID: _______________
 https://drive.google.com/file/d/1fNf7Hp9Yk7yuooqohkiZ5sAmTB_8ut2e/view?usp=sharing
 ```
-
+https://drive.google.com/file/d/1FoVidXa3rt5ANpSPNzUrxwCN1Xv9Wg_M/view?usp=sharing
+https://drive.google.com/file/d/1jBE3tYjqG_nWw5Y7KRazD1SvDdHrhHgZ/view?usp=sharing
+https://drive.google.com/file/d/1vFyw9karH1eGttLdfP-N0aK2uoXHOJpf/view?usp=drive_link
+https://drive.google.com/file/d/156xcXLRkd4h2CWvBPIjZQ-MYu4RoJS3R/view?usp=drive_link
+https://drive.google.com/file/d/1fNf7Hp9Yk7yuooqohkiZ5sAmTB_8ut2e/view?usp=drive_link
 ---
 
 ## STEP 2 — main.py তে File ID বসাও
