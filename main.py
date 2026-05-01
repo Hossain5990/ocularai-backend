@@ -28,7 +28,6 @@ app.add_middleware(
 GDRIVE_FILES = {
     "densenet121_finetuned.h5": "1FoVidXa3rt5ANpSPNzUrxwCN1Xv9Wg_M",
     "best_clf.pkl":             "1jBE3tYjqG_nWw5Y7KRazD1SvDdHrhHgZ",
-    "selector.pkl":             "1vFyw9karH1eGttLdfP-N0aK2uoXHOJpf",
     "scaler.pkl":               "156xcXLRkd4h2CWvBPIjZQ-MYu4RoJS3R",
     "pca.pkl":                  "1fNf7Hp9Yk7yuooqohkiZ5sAmTB_8ut2e",
 }
@@ -185,17 +184,37 @@ def predict_image(image_bytes: bytes) -> dict:
     feats = feats.reshape(1, -1)
     print(f"Features shape: {feats.shape}")
 
-    # Step 3: Scale (if scaler available)
-    if _models["scaler"] is not None:
-        feats = _models["scaler"].transform(feats)
-        print("✅ Scaled")
+    # Auto-detect correct pipeline order by trying both orders
+    # Order A: Scaler → SelectKBest (most common)
+    # Order B: PCA → Scaler → SelectKBest (if scaler expects 256 features)
+    original_feats = feats.copy()
 
-    # Step 4: Reduce (if reducer available)
-    if _models["reducer"] is not None:
-        feats = _models["reducer"].transform(feats)
-        print(f"✅ Reduced via {_models['reducer_name']}, shape: {feats.shape}")
+    try:
+        temp = feats
+        if _models["scaler"] is not None:
+            temp = _models["scaler"].transform(temp)
+        if _models["selector"] is not None and hasattr(_models["selector"], "transform"):
+            temp = _models["selector"].transform(temp)
+        feats = temp
+        print(f"✅ Order A (Scaler→SelectKBest), shape: {feats.shape}")
+    except Exception as e1:
+        print(f"⚠ Order A failed ({e1}), trying Order B (PCA→Scaler→SelectKBest)...")
+        try:
+            temp = original_feats
+            if _models["pca"] is not None:
+                temp = _models["pca"].transform(temp)
+                print(f"✅ PCA done, shape: {temp.shape}")
+            if _models["scaler"] is not None:
+                temp = _models["scaler"].transform(temp)
+                print(f"✅ Scaled, shape: {temp.shape}")
+            if _models["selector"] is not None and hasattr(_models["selector"], "transform"):
+                temp = _models["selector"].transform(temp)
+                print(f"✅ SelectKBest done, shape: {temp.shape}")
+            feats = temp
+        except Exception as e2:
+            raise RuntimeError(f"Both pipeline orders failed. A: {e1} | B: {e2}")
 
-    # Step 5: Classify
+    # Step 6: Classify
     clf = _models["clf"]
     pred_raw = clf.predict(feats)[0]
     print(f"Raw prediction: {pred_raw} (type: {type(pred_raw).__name__})")
