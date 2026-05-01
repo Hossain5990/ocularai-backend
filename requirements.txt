@@ -5,5 +5,5 @@ Pillow>=9.5.0
 numpy>=1.26.4
 tensorflow-cpu>=2.16.0
 scikit-learn==1.4.2
-gdown>=5.1.0
+gdown==4.7.3
 h5py>=3.9.0

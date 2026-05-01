@@ -77,7 +77,7 @@ def download_file(filename: str) -> str:
 
     print(f"⬇ Downloading {filename} ...")
     url = f"https://drive.google.com/uc?id={file_id}"
-    out = gdown.download(url, path, quiet=False, fuzzy=True)
+    out = gdown.download(url, path, quiet=False)
     if not out or not os.path.exists(path):
         raise RuntimeError(
             f"❌ Failed to download '{filename}'. "
