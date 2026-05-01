@@ -103,7 +103,6 @@ def load_pkl(filename: str):
 
 def build_feature_extractor(full_model):
     """Extract features from GlobalAveragePooling layer."""
-    # Try to find GAP layer by name
     gap_layer = None
     for layer in reversed(full_model.layers):
         name = layer.name.lower()
@@ -112,11 +111,14 @@ def build_feature_extractor(full_model):
             break
 
     if gap_layer is None:
-        # Fallback: use second-to-last layer
         gap_layer = full_model.layers[-2]
         print(f"⚠ No GAP layer found, using: {gap_layer.name}")
     else:
-        print(f"✅ Using GAP layer: {gap_layer.name}, shape: {gap_layer.output_shape}")
+        try:
+            shape = tuple(gap_layer.output.shape)
+        except Exception:
+            shape = "unknown"
+        print(f"✅ Using GAP layer: {gap_layer.name}, shape: {shape}")
 
     return Model(inputs=full_model.input, outputs=gap_layer.output)
 
