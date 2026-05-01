@@ -21,19 +21,30 @@ app.add_middleware(
 )
 
 # ══════════════════════════════════════════════════════
-# তোমার Google Drive File IDs এখানে বসাও
-# Drive → file এ right click → Share → Anyone with link
-# Link: drive.google.com/file/d/THIS_PART/view
+# Google Drive File IDs — তোমার actual IDs বসাও
 # ══════════════════════════════════════════════════════
 GDRIVE_FILES = {
     "densenet121_finetuned.h5": "1FoVidXa3rt5ANpSPNzUrxwCN1Xv9Wg_M",
     "best_clf.pkl":             "1jBE3tYjqG_nWw5Y7KRazD1SvDdHrhHgZ",
+    "selector.pkl":             "1vFyw9karH1eGttLdfP-N0aK2uoXHOJpf",
     "scaler.pkl":               "156xcXLRkd4h2CWvBPIjZQ-MYu4RoJS3R",
     "pca.pkl":                  "1fNf7Hp9Yk7yuooqohkiZ5sAmTB_8ut2e",
 }
 
 MODEL_DIR = "/tmp/ocularai_models"
 os.makedirs(MODEL_DIR, exist_ok=True)
+
+# ══════════════════════════════════════════════════════
+# Notebook থেকে পাওয়া exact pipeline:
+#
+# feat_extractor = model.layers[-3].output  → 256-dim features
+#
+# Best model = SVM + SelectKBest (95.86%)
+# Pipeline:  image → DenseNet[-3] → 256 feats → SelectKBest → SVM
+#
+# PCA pipeline (backup):
+# image → DenseNet[-3] → 256 feats → StandardScaler → PCA(200) → SVM
+# ══════════════════════════════════════════════════════
 
 CLASS_NAMES = ["CNV", "DME", "DRUSEN", "NORMAL", "MH", "CSR", "AMD", "BRVO"]
 
@@ -43,7 +54,7 @@ DISEASE_INFO = {
     "DME":    {"full": "Diabetic Macular Edema", "severity": "High",
                "desc": "Fluid in the macula due to diabetic vascular leakage. Leading cause of vision loss in diabetic patients. Anti-VEGF or laser treatment required."},
     "DRUSEN": {"full": "Drusen Deposits", "severity": "Moderate",
-               "desc": "Yellow deposits under the retina — an early sign of AMD. Monitor closely; AREDS2 supplements may slow progression."},
+               "desc": "Yellow deposits under the retina — early sign of AMD. Monitor closely; AREDS2 supplements may slow progression."},
     "NORMAL": {"full": "Normal Healthy Retina", "severity": "None",
                "desc": "No pathological changes detected. Retinal structure appears intact. Continue routine annual eye check-ups."},
     "MH":     {"full": "Macular Hole", "severity": "High",
@@ -56,205 +67,159 @@ DISEASE_INFO = {
                "desc": "Retinal vein blockage causing hemorrhage and macular edema. Treated with anti-VEGF and laser photocoagulation."},
 }
 
-# Global model cache
 _models = {}
 
 
 def download_file(filename: str) -> str:
-    """Download from Google Drive if not cached."""
     path = os.path.join(MODEL_DIR, filename)
     if os.path.exists(path):
-        print(f"✅ Using cached: {filename}")
+        print(f"✅ Cached: {filename}")
         return path
-
     file_id = GDRIVE_FILES.get(filename)
     if not file_id or "YOUR_" in file_id:
-        raise RuntimeError(
-            f"❌ File ID not set for '{filename}'. "
-            "Open main.py and fill in GDRIVE_FILES."
-        )
-
+        raise RuntimeError(f"File ID not set for '{filename}'.")
     print(f"⬇ Downloading {filename} ...")
     url = f"https://drive.google.com/uc?id={file_id}"
     out = gdown.download(url, path, quiet=False)
     if not out or not os.path.exists(path):
-        raise RuntimeError(
-            f"❌ Failed to download '{filename}'. "
-            "Check that the file is shared as 'Anyone with the link'."
-        )
-    size_mb = os.path.getsize(path) / (1024 * 1024)
-    print(f"✅ Downloaded {filename} ({size_mb:.1f} MB)")
+        raise RuntimeError(f"Failed to download '{filename}'. Check sharing settings.")
+    print(f"✅ Downloaded {filename} ({os.path.getsize(path)/1024/1024:.1f} MB)")
     return path
 
 
 def load_pkl(filename: str):
-    """Load a pickle file, return None if file ID not set."""
     try:
         path = download_file(filename)
         with open(path, "rb") as f:
             obj = pickle.load(f)
         print(f"✅ Loaded {filename}: {type(obj).__name__}")
         return obj
-    except RuntimeError as e:
-        print(f"⚠ Skipping {filename}: {e}")
+    except Exception as e:
+        print(f"⚠ Could not load {filename}: {e}")
         return None
 
 
-def build_feature_extractor(full_model):
-    """Extract features from GlobalAveragePooling layer."""
-    gap_layer = None
-    for layer in reversed(full_model.layers):
-        name = layer.name.lower()
-        if "global_average" in name or "avg_pool" in name or "gap" in name:
-            gap_layer = layer
-            break
-
-    if gap_layer is None:
-        gap_layer = full_model.layers[-2]
-        print(f"⚠ No GAP layer found, using: {gap_layer.name}")
-    else:
-        try:
-            shape = tuple(gap_layer.output.shape)
-        except Exception:
-            shape = "unknown"
-        print(f"✅ Using GAP layer: {gap_layer.name}, shape: {shape}")
-
-    return Model(inputs=full_model.input, outputs=gap_layer.output)
-
-
 def load_all_models():
-    """Load all models once and cache in _models dict."""
     if _models.get("ready"):
         return
 
-    print("=" * 50)
+    print("=" * 55)
     print("🔄 Loading all models...")
-    print("=" * 50)
+    print("=" * 55)
 
-    # 1. Load DenseNet121
+    # ── 1. Load full DenseNet121 model ──────────────────────
     h5_path = download_file("densenet121_finetuned.h5")
     full_model = load_model(h5_path)
-    print(f"✅ Full model loaded. Layers: {len(full_model.layers)}")
-    _models["extractor"] = build_feature_extractor(full_model)
+    total_layers = len(full_model.layers)
+    print(f"✅ Full model loaded. Total layers: {total_layers}")
 
-    # 2. Load classifier (required)
-    _models["clf"] = load_pkl("best_clf.pkl")
+    # ── 2. Build feature extractor ──────────────────────────
+    # Notebook: feat_extractor = Model(inputs, outputs=model.layers[-3].output)
+    # layers[-3] = Dense(256) output → 256-dim feature vector
+    target_layer = full_model.layers[-3]
+    print(f"✅ Feature layer: {target_layer.name} (layers[-3])")
+
+    try:
+        shape = tuple(target_layer.output.shape)
+        print(f"✅ Feature shape: {shape}")
+    except Exception:
+        pass
+
+    _models["extractor"] = Model(
+        inputs=full_model.input,
+        outputs=target_layer.output
+    )
+
+    # ── 3. Load ML components ───────────────────────────────
+    _models["clf"]      = load_pkl("best_clf.pkl")   # SVM (required)
+    _models["selector"] = load_pkl("selector.pkl")   # SelectKBest (best pipeline)
+    _models["scaler"]   = load_pkl("scaler.pkl")     # StandardScaler (PCA pipeline)
+    _models["pca"]      = load_pkl("pca.pkl")        # PCA (backup pipeline)
+
     if _models["clf"] is None:
-        raise RuntimeError("best_clf.pkl is required but could not be loaded.")
+        raise RuntimeError("best_clf.pkl failed to load. Cannot predict.")
 
-    # 3. Load optional pipeline components
-    _models["scaler"]   = load_pkl("scaler.pkl")
-    _models["selector"] = load_pkl("selector.pkl")
-    _models["pca"]      = load_pkl("pca.pkl")
-
-    # 4. Detect pipeline type
-    sel = _models["selector"]
-    pca = _models["pca"]
-
-    if sel is not None and hasattr(sel, "transform"):
-        _models["reducer"] = sel
-        _models["reducer_name"] = "SelectKBest"
-    elif pca is not None and hasattr(pca, "transform"):
-        _models["reducer"] = pca
-        _models["reducer_name"] = "PCA"
+    # ── 4. Determine pipeline ───────────────────────────────
+    # Best = SelectKBest pipeline (no scaler needed)
+    # Backup = Scaler → PCA pipeline
+    if _models["selector"] is not None:
+        _models["pipeline"] = "kbest"
+        print("✅ Pipeline: DenseNet[-3](256) → SelectKBest → SVM")
+    elif _models["scaler"] is not None and _models["pca"] is not None:
+        _models["pipeline"] = "pca"
+        print("✅ Pipeline: DenseNet[-3](256) → StandardScaler → PCA → SVM")
     else:
-        _models["reducer"] = None
-        _models["reducer_name"] = "None"
+        _models["pipeline"] = "direct"
+        print("⚠ Pipeline: DenseNet[-3](256) → SVM (direct, no reduction)")
 
-    print(f"✅ Pipeline: scaler={_models['scaler'] is not None} | "
-          f"reducer={_models['reducer_name']} | "
-          f"clf={type(_models['clf']).__name__}")
     print("🚀 All models ready!")
     _models["ready"] = True
 
 
 def predict_image(image_bytes: bytes) -> dict:
-    """Full pipeline: bytes → disease prediction."""
     load_all_models()
 
-    # Step 1: Preprocess image
+    # ── Step 1: Preprocess image ────────────────────────────
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     img = img.resize((224, 224), Image.LANCZOS)
     arr = np.array(img, dtype=np.float32)
     arr = preprocess_input(arr)
-    x = np.expand_dims(arr, axis=0)  # (1, 224, 224, 3)
+    x = np.expand_dims(arr, axis=0)   # (1, 224, 224, 3)
 
-    # Step 2: Feature extraction
+    # ── Step 2: DenseNet[-3] → 256-dim features ─────────────
     feats = _models["extractor"].predict(x, verbose=0)
     feats = feats.reshape(1, -1)
-    print(f"Features shape: {feats.shape}")
+    print(f"Features shape: {feats.shape}")  # should be (1, 256)
 
-    # Auto-detect correct pipeline order by trying both orders
-    # Order A: Scaler → SelectKBest (most common)
-    # Order B: PCA → Scaler → SelectKBest (if scaler expects 256 features)
-    original_feats = feats.copy()
+    # ── Step 3: Apply pipeline ──────────────────────────────
+    pipeline = _models["pipeline"]
 
-    try:
-        temp = feats
-        if _models["scaler"] is not None:
-            temp = _models["scaler"].transform(temp)
-        if _models["selector"] is not None and hasattr(_models["selector"], "transform"):
-            temp = _models["selector"].transform(temp)
-        feats = temp
-        print(f"✅ Order A (Scaler→SelectKBest), shape: {feats.shape}")
-    except Exception as e1:
-        print(f"⚠ Order A failed ({e1}), trying Order B (PCA→Scaler→SelectKBest)...")
-        try:
-            temp = original_feats
-            if _models["pca"] is not None:
-                temp = _models["pca"].transform(temp)
-                print(f"✅ PCA done, shape: {temp.shape}")
-            if _models["scaler"] is not None:
-                temp = _models["scaler"].transform(temp)
-                print(f"✅ Scaled, shape: {temp.shape}")
-            if _models["selector"] is not None and hasattr(_models["selector"], "transform"):
-                temp = _models["selector"].transform(temp)
-                print(f"✅ SelectKBest done, shape: {temp.shape}")
-            feats = temp
-        except Exception as e2:
-            raise RuntimeError(f"Both pipeline orders failed. A: {e1} | B: {e2}")
+    if pipeline == "kbest":
+        # Best pipeline: SelectKBest only (no scaler)
+        feats = _models["selector"].transform(feats)
+        print(f"✅ SelectKBest → shape: {feats.shape}")
 
-    # Step 6: Classify
+    elif pipeline == "pca":
+        # Backup: StandardScaler → PCA
+        feats = _models["scaler"].transform(feats)
+        feats = _models["pca"].transform(feats)
+        print(f"✅ Scaler+PCA → shape: {feats.shape}")
+
+    # else: direct (no reduction)
+
+    # ── Step 4: SVM predict ─────────────────────────────────
     clf = _models["clf"]
     pred_raw = clf.predict(feats)[0]
-    print(f"Raw prediction: {pred_raw} (type: {type(pred_raw).__name__})")
+    print(f"Raw prediction: {pred_raw}")
 
-    # Handle both int index and string class name
+    # Handle int index or string class name
     if isinstance(pred_raw, (int, np.integer)):
-        pred_class = CLASS_NAMES[int(pred_raw)] if int(pred_raw) < len(CLASS_NAMES) else str(pred_raw)
-    elif isinstance(pred_raw, (str, np.str_)):
-        pred_class = str(pred_raw)
-        # normalize e.g. "NORMAL" already correct
+        pred_class = CLASS_NAMES[int(pred_raw)] if int(pred_raw) < len(CLASS_NAMES) else "NORMAL"
     else:
         pred_class = str(pred_raw)
 
-    # Probabilities
+    # ── Step 5: Probabilities ───────────────────────────────
     if hasattr(clf, "predict_proba"):
-        proba = clf.predict_proba(feats)[0]
-        # Build class→prob mapping
+        proba_raw = clf.predict_proba(feats)[0]
         if hasattr(clf, "classes_"):
-            classes = clf.classes_
             prob_map = {}
-            for c, p in zip(classes, proba):
+            for c, p in zip(clf.classes_, proba_raw):
                 key = CLASS_NAMES[int(c)] if isinstance(c, (int, np.integer)) else str(c)
                 prob_map[key] = float(p)
         else:
-            prob_map = {CLASS_NAMES[i]: float(p) for i, p in enumerate(proba) if i < len(CLASS_NAMES)}
+            prob_map = {CLASS_NAMES[i]: float(p)
+                        for i, p in enumerate(proba_raw) if i < len(CLASS_NAMES)}
 
-        sorted_classes = sorted(prob_map.items(), key=lambda x: x[1], reverse=True)
-        top1_class = sorted_classes[0][0]
-        top1_conf  = sorted_classes[0][1]
-        top2_class = sorted_classes[1][0] if len(sorted_classes) > 1 else None
-        top2_conf  = sorted_classes[1][1] if len(sorted_classes) > 1 else 0.0
+        sorted_cls = sorted(prob_map.items(), key=lambda x: x[1], reverse=True)
+        top1_class, top1_conf = sorted_cls[0]
+        top2_class = sorted_cls[1][0] if len(sorted_cls) > 1 else None
+        top2_conf  = sorted_cls[1][1] if len(sorted_cls) > 1 else 0.0
     else:
-        # No probabilities (e.g. LinearSVC)
-        top1_class = pred_class
-        top1_conf  = 1.0
-        top2_class = None
-        top2_conf  = 0.0
-        prob_map   = {pred_class: 1.0}
+        top1_class, top1_conf = pred_class, 1.0
+        top2_class, top2_conf = None, 0.0
+        prob_map = {pred_class: 1.0}
 
-    info = DISEASE_INFO.get(top1_class, DISEASE_INFO.get("NORMAL"))
+    info = DISEASE_INFO.get(top1_class, DISEASE_INFO["NORMAL"])
 
     return {
         "disease":              top1_class,
@@ -265,10 +230,11 @@ def predict_image(image_bytes: bytes) -> dict:
         "secondary":            top2_class,
         "secondary_confidence": round(top2_conf, 4),
         "all_probabilities":    {k: round(v, 4) for k, v in prob_map.items()},
+        "pipeline_used":        _models.get("pipeline", "unknown"),
     }
 
 
-# ── Routes ──────────────────────────────────────────
+# ── Routes ──────────────────────────────────────────────────
 
 @app.get("/")
 def root():
@@ -278,35 +244,36 @@ def root():
 @app.get("/health")
 def health():
     return {
-        "status": "healthy",
-        "model_loaded": _models.get("ready", False),
-        "pipeline": _models.get("reducer_name", "not loaded"),
+        "status":        "healthy",
+        "model_loaded":  _models.get("ready", False),
+        "pipeline":      _models.get("pipeline", "not loaded"),
     }
 
 
 @app.get("/debug")
 def debug():
-    """Shows which files are downloaded — useful for troubleshooting."""
     files = {}
     for name in GDRIVE_FILES:
         path = os.path.join(MODEL_DIR, name)
         files[name] = {
-            "id_set": "YOUR_" not in GDRIVE_FILES[name],
-            "downloaded": os.path.exists(path),
-            "size_mb": round(os.path.getsize(path) / 1024 / 1024, 2) if os.path.exists(path) else 0,
+            "id_set":      "YOUR_" not in GDRIVE_FILES[name],
+            "downloaded":  os.path.exists(path),
+            "size_mb":     round(os.path.getsize(path)/1024/1024, 2) if os.path.exists(path) else 0,
         }
-    return {"files": files, "models_loaded": _models.get("ready", False)}
+    return {
+        "files":         files,
+        "models_loaded": _models.get("ready", False),
+        "pipeline":      _models.get("pipeline", "not loaded"),
+    }
 
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
     if not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Only image files accepted.")
-
     contents = await file.read()
     if len(contents) > 15 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="Image too large. Max 15 MB.")
-
     try:
         result = predict_image(contents)
         return JSONResponse(content={"success": True, **result})
@@ -314,6 +281,5 @@ async def predict(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
         import traceback
-        tb = traceback.format_exc()
-        print(f"❌ Prediction error:\n{tb}")
+        print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
