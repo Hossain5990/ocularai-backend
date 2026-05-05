@@ -16,11 +16,11 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 # Google Drive File IDs
 # ═══════════════════════════════════════════════════
 GDRIVE_FILES = {
-    "densenet121_finetuned.h5": "YOUR_H5_FILE_ID_HERE",
-    "best_clf.pkl":             "YOUR_CLF_FILE_ID_HERE",
-    "selector.pkl":             "YOUR_SELECTOR_FILE_ID_HERE",
-    "scaler.pkl":               "YOUR_SCALER_FILE_ID_HERE",
-    "pca.pkl":                  "YOUR_PCA_FILE_ID_HERE",
+    "densenet121_finetuned.h5": "1FoVidXa3rt5ANpSPNzUrxwCN1Xv9Wg_M",
+    "best_clf.pkl":             "1jBE3tYjqG_nWw5Y7KRazD1SvDdHrhHgZ",
+    "selector.pkl":             "1vFyw9karH1eGttLdfP-N0aK2uoXHOJpf",
+    "scaler.pkl":               "156xcXLRkd4h2CWvBPIjZQ-MYu4RoJS3R",
+    "pca.pkl":                  "1fNf7Hp9Yk7yuooqohkiZ5sAmTB_8ut2e",
 }
 
 # ═══════════════════════════════════════════════════
