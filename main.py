@@ -1,4 +1,5 @@
-import os, io, pickle, base64, httpx
+import os, io, pickle
+import shap
 import gdown
 import numpy as np
 from PIL import Image
@@ -22,12 +23,6 @@ GDRIVE_FILES = {
     "scaler.pkl":               "156xcXLRkd4h2CWvBPIjZQ-MYu4RoJS3R",
     "pca.pkl":                  "1fNf7Hp9Yk7yuooqohkiZ5sAmTB_8ut2e",
 }
-
-# ═══════════════════════════════════════════════════
-# Anthropic API Key — Render Environment Variable থেকে নেবে
-# Render Dashboard → Environment → Add: ANTHROPIC_API_KEY = sk-ant-...
-# ═══════════════════════════════════════════════════
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 MODEL_DIR = "/tmp/ocularai_models"
 os.makedirs(MODEL_DIR, exist_ok=True)
@@ -55,60 +50,7 @@ DISEASE_INFO = {
 }
 
 _models = {}
-
-
-# ═══════════════════════════════════════════════════
-# Step 1: Claude Vision — retinal OCT কিনা check
-# ═══════════════════════════════════════════════════
-async def is_retinal_oct(image_bytes: bytes, media_type: str) -> tuple[bool, str]:
-    """
-    Claude Vision দিয়ে check করে image টা retinal OCT scan কিনা।
-    Returns: (is_retinal: bool, reason: str)
-    """
-    if not ANTHROPIC_API_KEY:
-        # API key না থাকলে validation skip করো
-        print("⚠ No ANTHROPIC_API_KEY — skipping retinal validation")
-        return True, "validation_skipped"
-
-    b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
-
-    payload = {
-        "model": "claude-sonnet-4-20250514",
-        "max_tokens": 100,
-        "system": (
-            "You are a medical image classifier. "
-            "Your ONLY job: decide if the image is a retinal OCT (Optical Coherence Tomography) scan. "
-            "Retinal OCT scans show cross-sectional layers of the retina — grayscale, horizontal bands. "
-            "Reply with ONLY one word: YES or NO."
-        ),
-        "messages": [{
-            "role": "user",
-            "content": [
-                {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
-                {"type": "text",  "text": "Is this a retinal OCT scan? Reply YES or NO only."}
-            ]
-        }]
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            resp = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": ANTHROPIC_API_KEY,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
-                json=payload
-            )
-        data = resp.json()
-        answer = data["content"][0]["text"].strip().upper()
-        print(f"Claude validation: {answer}")
-        is_oct = answer.startswith("YES")
-        return is_oct, answer
-    except Exception as e:
-        print(f"⚠ Claude validation failed: {e} — allowing image through")
-        return True, f"validation_error: {e}"
+_shap_cache = {}   # background data cache for KernelExplainer
 
 
 # ═══════════════════════════════════════════════════
@@ -176,6 +118,67 @@ def load_all_models():
     _models["ready"] = True
 
 
+def compute_shap(feats_reduced: np.ndarray, pred_class: str) -> list:
+    """
+    SHAP KernelExplainer দিয়ে top-10 feature importance বের করে।
+    Notebook cell 35 এর same approach।
+    """
+    try:
+        clf = _models["clf"]
+        if not hasattr(clf, "predict_proba"):
+            return []
+
+        # Background data: zero vector (fast approximation)
+        # Full KernelExplainer এর জন্য training data লাগে
+        # এখানে mean=0 background use করছি (fast)
+        n_feats = feats_reduced.shape[1]
+
+        if "explainer" not in _shap_cache or _shap_cache.get("n_feats") != n_feats:
+            print(f"Building SHAP KernelExplainer (n_feats={n_feats})...")
+            bg = np.zeros((1, n_feats))  # single zero background — fast
+            _shap_cache["explainer"] = shap.KernelExplainer(
+                clf.predict_proba, bg
+            )
+            _shap_cache["n_feats"] = n_feats
+            print("SHAP explainer ready")
+
+        explainer = _shap_cache["explainer"]
+
+        # Calculate SHAP values (nsamples=20 → fast but approximate)
+        shap_vals = explainer.shap_values(feats_reduced, nsamples=20)
+
+        # Get class index
+        if pred_class in CLASS_NAMES:
+            cls_idx = CLASS_NAMES.index(pred_class)
+        else:
+            cls_idx = 0
+
+        # shap_vals shape: (n_classes, n_samples, n_features) or list
+        if isinstance(shap_vals, list):
+            sv = shap_vals[cls_idx][0]   # (n_features,)
+        else:
+            sv = shap_vals[0]
+
+        # Top 10 features by absolute value
+        abs_sv   = np.abs(sv)
+        top_idx  = np.argsort(abs_sv)[::-1][:10]
+
+        result = []
+        for i in top_idx:
+            result.append({
+                "feature": f"F{int(i)}",
+                "value":   round(float(sv[i]), 4),
+                "abs":     round(float(abs_sv[i]), 4),
+            })
+
+        print(f"SHAP done. Top feature: {result[0] if result else 'none'}")
+        return result
+
+    except Exception as e:
+        print(f"SHAP error: {e}")
+        return []
+
+
 def run_prediction(image_bytes: bytes) -> dict:
     load_all_models()
 
@@ -220,6 +223,10 @@ def run_prediction(image_bytes: bytes) -> dict:
         prob_map = {pred_class: 1.0}
 
     info = DISEASE_INFO.get(top1_class, DISEASE_INFO["NORMAL"])
+
+    # ── SHAP XAI ────────────────────────────────────────
+    shap_values = compute_shap(feats, top1_class)
+
     return {
         "disease":              top1_class,
         "confidence":           round(top1_conf, 4),
@@ -229,6 +236,7 @@ def run_prediction(image_bytes: bytes) -> dict:
         "secondary":            top2_class,
         "secondary_confidence": round(top2_conf, 4),
         "all_probabilities":    {k: round(v, 4) for k, v in prob_map.items()},
+        "shap_values":          shap_values,
     }
 
 
@@ -246,7 +254,6 @@ def health():
         "model_loaded":    _models.get("ready", False),
         "pipeline":        _models.get("pipeline", "not loaded"),
         "classes":         CLASS_NAMES,
-        "claude_validate": bool(ANTHROPIC_API_KEY),
     }
 
 @app.get("/debug")
@@ -264,7 +271,6 @@ def debug():
         "models_loaded": _models.get("ready", False),
         "pipeline":      _models.get("pipeline", "not loaded"),
         "class_order":   {i: c for i, c in enumerate(CLASS_NAMES)},
-        "claude_key_set": bool(ANTHROPIC_API_KEY),
     }
 
 @app.post("/predict")
@@ -276,23 +282,7 @@ async def predict(file: UploadFile = File(...)):
     if len(contents) > 15 * 1024 * 1024:
         raise HTTPException(400, "Image too large. Max 15 MB.")
 
-    media_type = file.content_type or "image/jpeg"
-
-    # ── Step 1: Claude Vision validation ────────────────
-    is_oct, reason = await is_retinal_oct(contents, media_type)
-
-    if not is_oct:
-        return JSONResponse({
-            "success":    False,
-            "is_retinal": False,
-            "message":    (
-                "This does not appear to be a retinal OCT scan. "
-                "Please upload a valid cross-sectional retinal OCT image. "
-                "Regular photos, selfies, or other medical images are not supported."
-            )
-        })
-
-    # ── Step 2: SVM prediction ───────────────────────────
+    # ── Direct SVM prediction (no retinal validation) ──
     try:
         result = run_prediction(contents)
         return JSONResponse({"success": True, "is_retinal": True, **result})
