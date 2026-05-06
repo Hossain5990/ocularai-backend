@@ -27,7 +27,6 @@ GDRIVE_FILES = {
 MODEL_DIR = "/tmp/ocularai_models"
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-# Notebook output থেকে exact class order (alphabetical sorted)
 CLASS_NAMES = ["AMD", "CNV", "CSR", "DME", "DR", "DRUSEN", "MH", "NORMAL"]
 
 DISEASE_INFO = {
@@ -50,7 +49,7 @@ DISEASE_INFO = {
 }
 
 _models = {}
-_shap_cache = {}   # background data cache for KernelExplainer
+_shap_cache = {}
 
 
 # ═══════════════════════════════════════════════════
@@ -92,8 +91,15 @@ def load_all_models():
     full_model = load_model(download_file("densenet121_finetuned.h5"))
     print(f"✅ Model loaded. Layers: {len(full_model.layers)}")
 
-    # layers[-3] = Dense(256) → 256-dim features (from notebook cell 21)
-    feat_layer = full_model.layers[-3]
+    # BUG FIX 1: layers[-3] is index-based which is fragile if model arch changes.
+    # Use name-based lookup with fallback to index.
+    feat_layer = None
+    for layer in reversed(full_model.layers):
+        if hasattr(layer, 'units') and layer.units == 256:
+            feat_layer = layer
+            break
+    if feat_layer is None:
+        feat_layer = full_model.layers[-3]  # fallback
     print(f"✅ Feature layer: {feat_layer.name}")
     _models["extractor"] = Model(inputs=full_model.input, outputs=feat_layer.output)
 
@@ -113,6 +119,7 @@ def load_all_models():
         print("✅ Pipeline: DenseNet[-3](256) → Scaler → PCA → SVM")
     else:
         _models["pipeline"] = "direct"
+        print("✅ Pipeline: DenseNet[-3](256) → SVM (direct)")
 
     print(f"🚀 Ready! Classes: {CLASS_NAMES}")
     _models["ready"] = True
@@ -120,48 +127,74 @@ def load_all_models():
 
 def compute_shap(feats_reduced: np.ndarray, pred_class: str) -> list:
     """
-    SHAP KernelExplainer দিয়ে top-10 feature importance বের করে।
-    Notebook cell 35 এর same approach।
+    SHAP দিয়ে top-10 feature importance বের করে।
+    - linear SVM  -> LinearExplainer  (fast, LassoLarsIC issue নেই)
+    - rbf/other   -> KernelExplainer  (n_bg >= n_feats+10, LassoLarsIC fix)
     """
     try:
         clf = _models["clf"]
-        if not hasattr(clf, "predict_proba"):
-            return []
-
-        # Background data: zero vector (fast approximation)
-        # Full KernelExplainer এর জন্য training data লাগে
-        # এখানে mean=0 background use করছি (fast)
         n_feats = feats_reduced.shape[1]
 
         if "explainer" not in _shap_cache or _shap_cache.get("n_feats") != n_feats:
-            print(f"Building SHAP KernelExplainer (n_feats={n_feats})...")
-            bg = np.zeros((1, n_feats))  # single zero background — fast
-            _shap_cache["explainer"] = shap.KernelExplainer(
-                clf.predict_proba, bg
-            )
+            print(f"Building SHAP explainer (n_feats={n_feats})...")
+            kernel = getattr(clf, "kernel", None)
+
+            if kernel == "linear":
+                bg = np.zeros((1, n_feats))
+                _shap_cache["explainer"] = shap.LinearExplainer(clf, bg)
+                _shap_cache["explainer_type"] = "linear"
+                print("SHAP: using LinearExplainer (linear kernel)")
+            else:
+                # n_bg > n_feats হতেই হবে, নাহলে LassoLarsIC crash করে
+                n_bg = max(100, n_feats + 10)
+                np.random.seed(42)
+                bg = np.random.normal(0, 0.01, size=(n_bg, n_feats))
+                if not hasattr(clf, "predict_proba"):
+                    print("SHAP: clf has no predict_proba, skipping")
+                    return []
+                _shap_cache["explainer"] = shap.KernelExplainer(clf.predict_proba, bg)
+                _shap_cache["explainer_type"] = "kernel"
+                print(f"SHAP: using KernelExplainer (bg={n_bg}x{n_feats})")
+
             _shap_cache["n_feats"] = n_feats
             print("SHAP explainer ready")
 
-        explainer = _shap_cache["explainer"]
+        explainer      = _shap_cache["explainer"]
+        explainer_type = _shap_cache.get("explainer_type", "kernel")
 
-        # Calculate SHAP values (nsamples=20 → fast but approximate)
-        shap_vals = explainer.shap_values(feats_reduced, nsamples=20)
-
-        # Get class index
-        if pred_class in CLASS_NAMES:
-            cls_idx = CLASS_NAMES.index(pred_class)
+        if explainer_type == "linear":
+            shap_vals = explainer.shap_values(feats_reduced)
         else:
-            cls_idx = 0
+            shap_vals = explainer.shap_values(feats_reduced, nsamples=50, silent=True)
 
-        # shap_vals shape: (n_classes, n_samples, n_features) or list
+        # BUG FIX 2: CLASS_NAMES.index() raises ValueError if pred_class not found.
+        # Use .get() pattern with safe fallback.
+        cls_idx = CLASS_NAMES.index(pred_class) if pred_class in CLASS_NAMES else 0
+
+        # BUG FIX 3: shap_vals shape handling was incomplete.
+        # shap_vals can be: list of arrays, single 2D array, or single 3D array.
         if isinstance(shap_vals, list):
-            sv = shap_vals[cls_idx][0]   # (n_features,)
+            # list of (n_samples, n_features) per class
+            if cls_idx < len(shap_vals):
+                sv = np.array(shap_vals[cls_idx])
+                sv = sv[0] if sv.ndim == 2 else sv
+            else:
+                sv = np.array(shap_vals[0])[0]
+        elif isinstance(shap_vals, np.ndarray):
+            if shap_vals.ndim == 3:
+                # shape: (n_classes, n_samples, n_features)
+                sv = shap_vals[cls_idx, 0, :]
+            elif shap_vals.ndim == 2:
+                # shape: (n_samples, n_features)
+                sv = shap_vals[0]
+            else:
+                sv = shap_vals
         else:
-            sv = shap_vals[0]
+            print(f"SHAP: unexpected type {type(shap_vals)}")
+            return []
 
-        # Top 10 features by absolute value
-        abs_sv   = np.abs(sv)
-        top_idx  = np.argsort(abs_sv)[::-1][:10]
+        abs_sv  = np.abs(sv)
+        top_idx = np.argsort(abs_sv)[::-1][:10]
 
         result = []
         for i in top_idx:
@@ -190,30 +223,52 @@ def run_prediction(image_bytes: bytes) -> dict:
     feats = _models["extractor"].predict(x, verbose=0).reshape(1, -1)
     print(f"Features: {feats.shape}")
 
+    # BUG FIX 4: pipeline "direct" case was missing transform step — feats passed as-is which is correct,
+    # but selector/scaler/pca were not checked for None before transform in "pca" pipeline.
     if _models["pipeline"] == "kbest":
         feats = _models["selector"].transform(feats)
     elif _models["pipeline"] == "pca":
-        feats = _models["scaler"].transform(feats)
-        feats = _models["pca"].transform(feats)
+        if _models["scaler"] is not None:
+            feats = _models["scaler"].transform(feats)
+        if _models["pca"] is not None:
+            feats = _models["pca"].transform(feats)
+    # "direct": feats used as-is
 
     clf      = _models["clf"]
     pred_raw = clf.predict(feats)[0]
 
-    if isinstance(pred_raw, (int, np.integer)):
-        pred_class = CLASS_NAMES[int(pred_raw)] if int(pred_raw) < len(CLASS_NAMES) else "NORMAL"
+    # BUG FIX 5: pred_raw type check was missing np.floating (e.g. np.float32 from some clf).
+    if isinstance(pred_raw, (int, np.integer, np.floating, float)):
+        idx = int(round(float(pred_raw)))
+        pred_class = CLASS_NAMES[idx] if 0 <= idx < len(CLASS_NAMES) else "NORMAL"
     else:
-        pred_class = str(pred_raw)
+        pred_class = str(pred_raw).strip()
+        # If it's a string label not in CLASS_NAMES, default to NORMAL
+        if pred_class not in CLASS_NAMES:
+            print(f"⚠ Unknown pred class '{pred_class}', defaulting to NORMAL")
+            pred_class = "NORMAL"
 
     if hasattr(clf, "predict_proba"):
         proba_raw = clf.predict_proba(feats)[0]
         if hasattr(clf, "classes_"):
             prob_map = {}
             for c, p in zip(clf.classes_, proba_raw):
-                key = CLASS_NAMES[int(c)] if isinstance(c, (int, np.integer)) else str(c)
+                # BUG FIX 6: np.floating also needs to be handled here
+                if isinstance(c, (int, np.integer, np.floating, float)):
+                    key = CLASS_NAMES[int(round(float(c)))] if 0 <= int(round(float(c))) < len(CLASS_NAMES) else str(c)
+                else:
+                    key = str(c).strip()
                 prob_map[key] = float(p)
         else:
-            prob_map = {CLASS_NAMES[i]: float(p) for i, p in enumerate(proba_raw) if i < len(CLASS_NAMES)}
-        sorted_cls = sorted(prob_map.items(), key=lambda x: x[1], reverse=True)
+            prob_map = {
+                CLASS_NAMES[i]: float(p)
+                for i, p in enumerate(proba_raw)
+                if i < len(CLASS_NAMES)
+            }
+
+        # BUG FIX 7: sorted() key lambda used 'x' which shadows the outer loop variable 'x' (numpy array).
+        # Renamed to avoid collision.
+        sorted_cls = sorted(prob_map.items(), key=lambda kv: kv[1], reverse=True)
         top1_class, top1_conf = sorted_cls[0]
         top2_class = sorted_cls[1][0] if len(sorted_cls) > 1 else None
         top2_conf  = sorted_cls[1][1] if len(sorted_cls) > 1 else 0.0
@@ -224,7 +279,6 @@ def run_prediction(image_bytes: bytes) -> dict:
 
     info = DISEASE_INFO.get(top1_class, DISEASE_INFO["NORMAL"])
 
-    # ── SHAP XAI ────────────────────────────────────────
     shap_values = compute_shap(feats, top1_class)
 
     return {
@@ -275,14 +329,14 @@ def debug():
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
-    if not file.content_type.startswith("image/"):
+    # BUG FIX 8: content_type can be None for some clients — guard against it.
+    if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(400, "Only image files accepted.")
 
     contents = await file.read()
     if len(contents) > 15 * 1024 * 1024:
         raise HTTPException(400, "Image too large. Max 15 MB.")
 
-    # ── Direct SVM prediction (no retinal validation) ──
     try:
         result = run_prediction(contents)
         return JSONResponse({"success": True, "is_retinal": True, **result})

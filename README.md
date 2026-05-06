@@ -34,6 +34,12 @@ https://drive.google.com/file/d/156xcXLRkd4h2CWvBPIjZQ-MYu4RoJS3R/view?usp=drive
 https://drive.google.com/file/d/1fNf7Hp9Yk7yuooqohkiZ5sAmTB_8ut2e/view?usp=drive_link
 ---
 
+ "densenet121_finetuned.h5": "1FoVidXa3rt5ANpSPNzUrxwCN1Xv9Wg_M",
+    "best_clf.pkl":             "1jBE3tYjqG_nWw5Y7KRazD1SvDdHrhHgZ",
+    "selector.pkl":             "1vFyw9karH1eGttLdfP-N0aK2uoXHOJpf",
+    "scaler.pkl":               "156xcXLRkd4h2CWvBPIjZQ-MYu4RoJS3R",
+    "pca.pkl":                  "1fNf7Hp9Yk7yuooqohkiZ5sAmTB_8ut2e",
+
 ## STEP 2 — main.py তে File ID বসাও
 
 `main.py` ফাইলে এই অংশটা খোঁজো:
