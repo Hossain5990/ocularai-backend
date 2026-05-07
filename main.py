@@ -99,8 +99,24 @@ def load_all_models():
     print("🔄 Loading all models...")
 
     model_path = download_file("densenet121_finetuned.h5")
-    # compile=False: optimizer state skip করে — load faster, no error
+
+    # Keras 3 এ batch_shape / optional keyword চেনে না — patch করি
+    import keras
+    from keras.src.layers import InputLayer
+
+    _original_from_config = InputLayer.from_config.__func__ if hasattr(InputLayer.from_config, '__func__') else InputLayer.from_config
+
+    @classmethod
+    def _patched_from_config(cls, config):
+        config.pop("batch_shape", None)
+        config.pop("optional", None)
+        return cls(**config)
+
+    InputLayer.from_config = _patched_from_config
+    print("InputLayer.from_config patched for Keras 3 compatibility")
+
     full_model = load_model(model_path, compile=False)
+    print("Model loaded successfully")
     print(f"✅ Model loaded. Layers: {len(full_model.layers)}")
 
     # BUG FIX 1: layers[-3] is index-based which is fragile if model arch changes.

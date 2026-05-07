@@ -1,3 +1,4 @@
+# ocularai-backend v3 — cache bust May 8
 fastapi==0.111.0
 uvicorn[standard]==0.29.0
 python-multipart==0.0.9
