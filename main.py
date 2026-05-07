@@ -1,7 +1,6 @@
 import os, io, pickle
 import gdown
 import numpy as np
-import shap
 from PIL import Image
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,9 +16,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ═══════════════════════════════════════════════
-# Google Drive File IDs — তোমার IDs বসাও
-# ═══════════════════════════════════════════════
 GDRIVE_FILES = {
    "densenet121_finetuned.h5": "1FoVidXa3rt5ANpSPNzUrxwCN1Xv9Wg_M",
     "best_clf.pkl":             "1jBE3tYjqG_nWw5Y7KRazD1SvDdHrhHgZ",
@@ -31,7 +27,6 @@ GDRIVE_FILES = {
 MODEL_DIR = "/tmp/ocularai_models"
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-# Notebook: CLASS_NAMES = sorted(train_cnt.keys()) → alphabetical
 CLASS_NAMES = ["AMD", "CNV", "CSR", "DME", "DR", "DRUSEN", "MH", "NORMAL"]
 
 DISEASE_INFO = {
@@ -53,8 +48,7 @@ DISEASE_INFO = {
                "desc": "No pathological changes detected. Retinal layers appear intact. Continue routine annual eye examinations."},
 }
 
-_models     = {}
-_shap_cache = {}
+_models = {}
 
 
 # ── Download helper ──────────────────────────────────
@@ -93,15 +87,42 @@ def load_all_models():
     print("=" * 55)
     print("🔄 Loading all models...")
 
-    # Load model — custom_object_scope fixes ZeroPadding2D DTypePolicy error
     model_path = download_file("densenet121_finetuned.h5")
+
+    import keras
+    print(f"Keras version: {keras.__version__}")
+
+    full_model = None
+
+    # Try 1: Normal load
     try:
-        # First try: normal load
         full_model = tf.keras.models.load_model(model_path, compile=False)
+        print("✅ Model loaded (normal).")
     except Exception as e1:
-        print(f"⚠ Normal load failed ({e1}), trying with custom objects...")
+        print(f"⚠ Normal load failed: {e1}")
+
+    # Try 2: Patch InputLayer to strip unknown kwargs (batch_shape, optional)
+    if full_model is None:
         try:
-            # Second try: with legacy compat
+            print("Trying patched InputLayer load...")
+            _orig_init = tf.keras.layers.InputLayer.__init__
+
+            def _patched_init(self, *args, **kwargs):
+                kwargs.pop("batch_shape", None)
+                kwargs.pop("optional", None)
+                _orig_init(self, *args, **kwargs)
+
+            tf.keras.layers.InputLayer.__init__ = _patched_init
+            full_model = tf.keras.models.load_model(model_path, compile=False)
+            print("✅ Model loaded (patched InputLayer).")
+        except Exception as e2:
+            print(f"⚠ Patched load failed: {e2}")
+            tf.keras.layers.InputLayer.__init__ = _orig_init
+
+    # Try 3: custom_objects
+    if full_model is None:
+        try:
+            print("Trying custom_objects load...")
             import tensorflow.keras.layers as kl
             custom_objs = {
                 "ZeroPadding2D": kl.ZeroPadding2D,
@@ -112,14 +133,21 @@ def load_all_models():
                 custom_objects=custom_objs,
                 compile=False
             )
-        except Exception as e2:
-            print(f"⚠ Custom objects failed ({e2}), trying tf.saved_model...")
-            # Third try: SavedModel format
+            print("✅ Model loaded (custom_objects).")
+        except Exception as e3:
+            print(f"⚠ Custom objects load failed: {e3}")
+
+    # Try 4: tf.saved_model
+    if full_model is None:
+        try:
+            print("Trying tf.saved_model.load...")
             full_model = tf.saved_model.load(model_path)
+            print("✅ Model loaded (saved_model).")
+        except Exception as e4:
+            raise RuntimeError(f"All model load attempts failed. Last error: {e4}")
 
     print(f"✅ Model loaded. Layers: {len(full_model.layers)}")
 
-    # Feature extractor: layers[-3] = Dense(256)
     feat_layer = full_model.layers[-3]
     print(f"✅ Feature layer: {feat_layer.name}")
     _models["extractor"] = tf.keras.Model(
@@ -127,7 +155,6 @@ def load_all_models():
         outputs=feat_layer.output
     )
 
-    # ML components
     _models["clf"]      = load_pkl("best_clf.pkl")
     _models["selector"] = load_pkl("selector.pkl")
     _models["scaler"]   = load_pkl("scaler.pkl")
@@ -136,7 +163,6 @@ def load_all_models():
     if _models["clf"] is None:
         raise RuntimeError("best_clf.pkl failed to load.")
 
-    # Pipeline detection
     if _models["selector"] is not None:
         _models["pipeline"] = "kbest"
         print("✅ Pipeline: DenseNet[-3](256) → SelectKBest → SVM")
@@ -151,45 +177,68 @@ def load_all_models():
     _models["ready"] = True
 
 
-# ── SHAP ─────────────────────────────────────────────
+# ── Lightweight Feature Importance (SHAP-style, no KernelExplainer) ──
 def compute_shap(feats_reduced: np.ndarray, pred_class: str) -> list:
-    """Top-10 SHAP feature importance for the predicted class."""
+    """
+    Fast lightweight feature importance — no KernelExplainer.
+    - Linear SVM  → exact coef_ weights  (instant)
+    - RBF / other → gradient perturbation on top-30 features (~0.05s)
+    Same output format as before — frontend কোনো change লাগবে না।
+    """
     try:
         clf = _models["clf"]
-        if not hasattr(clf, "predict_proba"):
-            return []
-
-        n_feats = feats_reduced.shape[1]
-
-        # Build explainer once and cache
-        if "explainer" not in _shap_cache or _shap_cache.get("n_feats") != n_feats:
-            print(f"Building SHAP KernelExplainer (n_feats={n_feats})...")
-            bg = np.zeros((1, n_feats))
-            _shap_cache["explainer"] = shap.KernelExplainer(clf.predict_proba, bg)
-            _shap_cache["n_feats"]   = n_feats
-            print("✅ SHAP explainer ready")
-
-        explainer = _shap_cache["explainer"]
-        shap_vals  = explainer.shap_values(feats_reduced, nsamples=20)
-
-        # Get class index
         cls_idx = CLASS_NAMES.index(pred_class) if pred_class in CLASS_NAMES else 0
+        n_feats = feats_reduced.shape[1]
+        feats_1d = feats_reduced[0]
 
-        # shap_vals: list of arrays (one per class)
-        sv = shap_vals[cls_idx][0] if isinstance(shap_vals, list) else shap_vals[0]
+        # ── Method 1: Linear SVM → coef_ directly ──────────────────
+        if hasattr(clf, "coef_"):
+            coef = clf.coef_
+            if coef.shape[0] > 1 and cls_idx < coef.shape[0]:
+                sv = coef[cls_idx] * feats_1d
+            else:
+                sv = coef[0] * feats_1d
+
+            abs_sv  = np.abs(sv)
+            top_idx = np.argsort(abs_sv)[::-1][:10]
+            print("✅ Feature importance (coef_ method)")
+            return [
+                {"feature": f"F{int(i)}", "value": round(float(sv[i]), 4), "abs": round(float(abs_sv[i]), 4)}
+                for i in top_idx
+            ]
+
+        # ── Method 2: Non-linear → perturbation on top-30 features ─
+        TOP_N = 30
+        base_score = clf.decision_function(feats_reduced)
+        if base_score.ndim > 1:
+            base_val = base_score[0][cls_idx] if base_score.shape[1] > cls_idx else base_score[0][0]
+        else:
+            base_val = float(base_score[0])
+
+        candidate_idx = np.argsort(np.abs(feats_1d))[::-1][:TOP_N]
+        sv  = np.zeros(n_feats)
+        eps = 1e-2
+
+        for i in candidate_idx:
+            perturbed        = feats_reduced.copy()
+            perturbed[0][i] += eps
+            new_score        = clf.decision_function(perturbed)
+            if new_score.ndim > 1:
+                new_val = new_score[0][cls_idx] if new_score.shape[1] > cls_idx else new_score[0][0]
+            else:
+                new_val = float(new_score[0])
+            sv[i] = (new_val - base_val) / eps
 
         abs_sv  = np.abs(sv)
         top_idx = np.argsort(abs_sv)[::-1][:10]
-
-        result = [
+        print("✅ Feature importance (perturbation method)")
+        return [
             {"feature": f"F{int(i)}", "value": round(float(sv[i]), 4), "abs": round(float(abs_sv[i]), 4)}
             for i in top_idx
         ]
-        print(f"✅ SHAP done. Top: {result[0]}")
-        return result
 
     except Exception as e:
-        print(f"⚠ SHAP error: {e}")
+        print(f"⚠ Feature importance error: {e}")
         return []
 
 
@@ -197,17 +246,14 @@ def compute_shap(feats_reduced: np.ndarray, pred_class: str) -> list:
 def run_prediction(image_bytes: bytes) -> dict:
     load_all_models()
 
-    # Preprocess
     img  = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     img  = img.resize((224, 224), Image.LANCZOS)
     arr  = preprocess_input(np.array(img, dtype=np.float32))
     x    = np.expand_dims(arr, axis=0)
 
-    # Feature extraction
     feats = _models["extractor"].predict(x, verbose=0).reshape(1, -1)
     print(f"Features shape: {feats.shape}")
 
-    # Pipeline
     pipeline = _models["pipeline"]
     if pipeline == "kbest":
         feats = _models["selector"].transform(feats)
@@ -215,7 +261,6 @@ def run_prediction(image_bytes: bytes) -> dict:
         feats = _models["scaler"].transform(feats)
         feats = _models["pca"].transform(feats)
 
-    # SVM predict
     clf      = _models["clf"]
     pred_raw = clf.predict(feats)[0]
     if isinstance(pred_raw, (int, np.integer)):
@@ -223,7 +268,6 @@ def run_prediction(image_bytes: bytes) -> dict:
     else:
         pred_class = str(pred_raw)
 
-    # Probabilities
     if hasattr(clf, "predict_proba"):
         proba_raw = clf.predict_proba(feats)[0]
         if hasattr(clf, "classes_"):
@@ -243,7 +287,6 @@ def run_prediction(image_bytes: bytes) -> dict:
         top2_class, top2_conf = None, 0.0
         prob_map = {pred_class: 1.0}
 
-    # SHAP
     shap_values = compute_shap(feats, top1_class)
 
     info = DISEASE_INFO.get(top1_class, DISEASE_INFO["NORMAL"])
