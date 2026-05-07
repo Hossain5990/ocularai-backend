@@ -8,15 +8,22 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import tensorflow as tf
 
-# TF 2.16+ এ tensorflow.keras deprecated — try standalone keras first
+# tf_keras = Keras 2 API, TF 2.16+ এ Keras 3 থেকে আলাদা রাখে
+# requirements.txt এ: tf-keras==2.15.0 থাকতে হবে
 try:
-    from keras.applications.densenet import preprocess_input
-    from keras.models import load_model, Model
-    print("Using standalone keras")
+    import tf_keras
+    from tf_keras.applications.densenet import preprocess_input
+    from tf_keras.models import load_model, Model
+    print("Using tf_keras (Keras 2 compat layer)")
 except ImportError:
-    from tensorflow.keras.applications.densenet import preprocess_input
-    from tensorflow.keras.models import load_model, Model
-    print("Using tensorflow.keras")
+    try:
+        from tensorflow.keras.applications.densenet import preprocess_input
+        from tensorflow.keras.models import load_model, Model
+        print("Using tensorflow.keras")
+    except ImportError:
+        from keras.applications.densenet import preprocess_input
+        from keras.models import load_model, Model
+        print("Using standalone keras")
 
 from contextlib import asynccontextmanager
 
@@ -106,7 +113,20 @@ def load_all_models():
     print("=" * 55)
     print("🔄 Loading all models...")
 
-    full_model = load_model(download_file("densenet121_finetuned.h5"))
+    model_path = download_file("densenet121_finetuned.h5")
+    try:
+        full_model = load_model(model_path, compile=False)
+    except TypeError as e:
+        print(f"load_model failed ({e}), retrying with custom_objects...")
+        # batch_shape / optional keyword error → Keras 3 incompatibility
+        # Force load via tf.keras.models with legacy format flag
+        import tensorflow as tf
+        full_model = tf.keras.models.load_model(
+            model_path,
+            compile=False,
+            options=tf.saved_model.LoadOptions(experimental_io_device="/job:localhost")
+            if hasattr(tf.saved_model, "LoadOptions") else None
+        )
     print(f"✅ Model loaded. Layers: {len(full_model.layers)}")
 
     # BUG FIX 1: layers[-3] is index-based which is fragile if model arch changes.
