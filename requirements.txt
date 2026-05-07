@@ -2,9 +2,10 @@ fastapi==0.111.0
 uvicorn[standard]==0.29.0
 python-multipart==0.0.9
 Pillow>=9.5.0
-numpy>=1.26.4
+numpy==1.26.4
 tensorflow-cpu==2.15.0
+tf-keras==2.15.0
 scikit-learn==1.4.2
 gdown==4.7.3
-h5py>=3.9.0
+h5py==3.11.0
 shap==0.44.1
