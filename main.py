@@ -7,10 +7,28 @@ from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import tensorflow as tf
-from tensorflow.keras.applications.densenet import preprocess_input
-from tensorflow.keras.models import load_model, Model
 
-app = FastAPI(title="OcularAI Eye Disease Detection API")
+# TF 2.16+ এ tensorflow.keras deprecated — try standalone keras first
+try:
+    from keras.applications.densenet import preprocess_input
+    from keras.models import load_model, Model
+    print("Using standalone keras")
+except ImportError:
+    from tensorflow.keras.applications.densenet import preprocess_input
+    from tensorflow.keras.models import load_model, Model
+    print("Using tensorflow.keras")
+
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app_instance):
+    # Startup: just print ready — model loads lazily on first request
+    print("OcularAI API starting up...")
+    yield
+    # Shutdown
+    print("OcularAI API shutting down...")
+
+app = FastAPI(title="OcularAI Eye Disease Detection API", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ═══════════════════════════════════════════════════
