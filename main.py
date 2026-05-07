@@ -8,16 +8,7 @@ from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import tensorflow as tf
-
-try:
-    import tf_keras
-    from tf_keras.applications.densenet import preprocess_input
-    print("✅ Using tf_keras")
-    KERAS_BACKEND = "tf_keras"
-except ImportError:
-    from tensorflow.keras.applications.densenet import preprocess_input
-    print("⚠ Falling back to tensorflow.keras")
-    KERAS_BACKEND = "tf"
+from tensorflow.keras.applications.densenet import preprocess_input
 
 app = FastAPI(title="OcularAI Eye Disease Detection API")
 app.add_middleware(
@@ -28,7 +19,7 @@ app.add_middleware(
 )
 
 GDRIVE_FILES = {
-   "densenet121_finetuned.h5": "1FoVidXa3rt5ANpSPNzUrxwCN1Xv9Wg_M",
+    "densenet121_finetuned.h5": "1FoVidXa3rt5ANpSPNzUrxwCN1Xv9Wg_M",
     "best_clf.pkl":             "1jBE3tYjqG_nWw5Y7KRazD1SvDdHrhHgZ",
     "selector.pkl":             "1vFyw9karH1eGttLdfP-N0aK2uoXHOJpf",
     "scaler.pkl":               "156xcXLRkd4h2CWvBPIjZQ-MYu4RoJS3R",
@@ -90,6 +81,43 @@ def load_pkl(filename: str):
         return None
 
 
+# ── h5py JSON config patch ───────────────────────────
+def load_model_via_h5py(model_path: str):
+    """
+    Directly patch the .h5 model config JSON to remove
+    'batch_shape' and 'optional' keys that Keras 3 doesn't understand.
+    This is the most reliable method across all Keras versions.
+    """
+    import h5py, json, re
+
+    with h5py.File(model_path, "r") as f:
+        raw_cfg = f.attrs.get("model_config")
+
+    if raw_cfg is None:
+        raise ValueError("model_config not found in h5 file.")
+
+    cfg_str = raw_cfg if isinstance(raw_cfg, str) else raw_cfg.decode("utf-8")
+
+    # Fix 1: rename batch_shape → shape
+    cfg_str = re.sub(r'"batch_shape"\s*:', '"shape":', cfg_str)
+
+    # Fix 2: remove "optional": true/false
+    cfg_str = re.sub(r',\s*"optional"\s*:\s*(true|false)', '', cfg_str)
+    cfg_str = re.sub(r'"optional"\s*:\s*(true|false)\s*,\s*', '', cfg_str)
+    cfg_str = re.sub(r'"optional"\s*:\s*(true|false)', '', cfg_str)
+
+    model_cfg = json.loads(cfg_str)
+
+    # Rebuild model from patched config
+    model = tf.keras.models.model_from_json(json.dumps(model_cfg))
+
+    # Load weights separately
+    model.load_weights(model_path)
+
+    print("✅ Model loaded via h5py JSON patch.")
+    return model
+
+
 # ── Model loading ────────────────────────────────────
 def load_all_models():
     if _models.get("ready"):
@@ -101,15 +129,13 @@ def load_all_models():
     model_path = download_file("densenet121_finetuned.h5")
     full_model = None
 
-    # Try 1: tf_keras direct — most reliable for old .h5 files
-    if KERAS_BACKEND == "tf_keras":
-        try:
-            full_model = tf_keras.models.load_model(model_path, compile=False)
-            print("✅ Model loaded via tf_keras.")
-        except Exception as e1:
-            print(f"⚠ tf_keras load failed: {e1}")
+    # Try 1: h5py JSON patch — PRIMARY method, works regardless of Keras version
+    try:
+        full_model = load_model_via_h5py(model_path)
+    except Exception as e1:
+        print(f"⚠ h5py patch failed: {e1}")
 
-    # Try 2: Patch InputLayer to strip batch_shape / optional
+    # Try 2: Patch InputLayer.__init__ to ignore unknown kwargs
     if full_model is None:
         try:
             print("Trying patched InputLayer load...")
@@ -124,31 +150,22 @@ def load_all_models():
             full_model = tf.keras.models.load_model(model_path, compile=False)
             print("✅ Model loaded (patched InputLayer).")
         except Exception as e2:
-            print(f"⚠ Patched load failed: {e2}")
+            print(f"⚠ Patched InputLayer failed: {e2}")
             try:
                 tf.keras.layers.InputLayer.__init__ = _orig_init
             except Exception:
                 pass
 
-    # Try 3: h5py config fix — replace batch_shape → shape in JSON
+    # Try 3: Normal load — works if TF_USE_LEGACY_KERAS=1 took effect
     if full_model is None:
         try:
-            print("Trying h5py config fix...")
-            import h5py, json, re
-            with h5py.File(model_path, "r") as f:
-                raw_cfg = f.attrs.get("model_config")
-            cfg_str = raw_cfg if isinstance(raw_cfg, str) else raw_cfg.decode()
-            cfg_str = re.sub(r'"batch_shape"', '"shape"', cfg_str)
-            cfg_str = re.sub(r',\s*"optional":\s*(true|false)', '', cfg_str)
-            cfg_str = re.sub(r'"optional":\s*(true|false),\s*', '', cfg_str)
-            model_json = json.loads(cfg_str)
-            full_model = tf.keras.models.model_from_json(json.dumps(model_json))
-            full_model.load_weights(model_path)
-            print("✅ Model loaded (h5py config fix).")
+            print("Trying normal load (legacy keras env)...")
+            full_model = tf.keras.models.load_model(model_path, compile=False)
+            print("✅ Model loaded (normal).")
         except Exception as e3:
-            print(f"⚠ h5py fix failed: {e3}")
+            print(f"⚠ Normal load failed: {e3}")
 
-    # Try 4: custom_objects scope
+    # Try 4: custom_objects
     if full_model is None:
         try:
             print("Trying custom_objects load...")
@@ -174,17 +191,10 @@ def load_all_models():
     # Feature extractor: layers[-3] = Dense(256)
     feat_layer = full_model.layers[-3]
     print(f"✅ Feature layer: {feat_layer.name}")
-
-    if KERAS_BACKEND == "tf_keras":
-        _models["extractor"] = tf_keras.Model(
-            inputs=full_model.input,
-            outputs=feat_layer.output
-        )
-    else:
-        _models["extractor"] = tf.keras.Model(
-            inputs=full_model.input,
-            outputs=feat_layer.output
-        )
+    _models["extractor"] = tf.keras.Model(
+        inputs=full_model.input,
+        outputs=feat_layer.output
+    )
 
     # ML components
     _models["clf"]      = load_pkl("best_clf.pkl")
@@ -344,11 +354,10 @@ def root():
 @app.get("/health")
 def health():
     return {
-        "status":        "healthy",
-        "model_loaded":  _models.get("ready", False),
-        "pipeline":      _models.get("pipeline", "not loaded"),
-        "classes":       CLASS_NAMES,
-        "keras_backend": KERAS_BACKEND,
+        "status":       "healthy",
+        "model_loaded": _models.get("ready", False),
+        "pipeline":     _models.get("pipeline", "not loaded"),
+        "classes":      CLASS_NAMES,
     }
 
 @app.get("/debug")
@@ -362,11 +371,10 @@ def debug():
             "size_mb":    round(os.path.getsize(path)/1024/1024, 2) if os.path.exists(path) else 0,
         }
     return {
-        "files":         files,
-        "loaded":        _models.get("ready", False),
-        "pipeline":      _models.get("pipeline", "not loaded"),
-        "keras_backend": KERAS_BACKEND,
-        "class_order":   {i: c for i, c in enumerate(CLASS_NAMES)},
+        "files":      files,
+        "loaded":     _models.get("ready", False),
+        "pipeline":   _models.get("pipeline", "not loaded"),
+        "class_order":{i: c for i, c in enumerate(CLASS_NAMES)},
     }
 
 @app.post("/predict")
