@@ -10,6 +10,85 @@ from fastapi.responses import JSONResponse
 import tensorflow as tf
 from tensorflow.keras.applications.densenet import preprocess_input
 
+# ═══════════════════════════════════════════════════════════
+# KERAS COMPATIBILITY PATCH
+# Render uses Keras 3.x which breaks old .h5 models.
+# We replace InputLayer and register DTypePolicy so the
+# model config deserializes correctly regardless of version.
+# ═══════════════════════════════════════════════════════════
+
+class _CompatInputLayer(tf.keras.layers.Layer):
+    """
+    Drop-in replacement for InputLayer that silently accepts
+    all legacy kwargs (batch_shape, optional, sparse, ragged).
+    """
+    def __init__(self, shape=None, batch_size=None, dtype=None,
+                 sparse=False, ragged=False, name=None,
+                 # legacy kwargs — accepted and ignored
+                 batch_shape=None, optional=None, **kwargs):
+        # batch_shape → shape
+        if shape is None and batch_shape is not None:
+            shape = batch_shape[1:]  # strip batch dim
+        super().__init__(name=name, dtype=dtype, **kwargs)
+        self._output_shape = shape
+        self._batch_size   = batch_size
+
+    def call(self, inputs):
+        return inputs
+
+    @classmethod
+    def from_config(cls, config):
+        # Accept any config key without crashing
+        config.pop("optional", None)
+        return cls(**config)
+
+
+class _DTypePolicy:
+    """Stub for keras DTypePolicy — only needs to survive deserialization."""
+    def __init__(self, name="float32", **kwargs):
+        self.name = name
+
+    def get_config(self):
+        return {"name": self.name}
+
+
+def _apply_keras_patches():
+    """Monkey-patch Keras internals once at startup."""
+    try:
+        # Patch InputLayer
+        tf.keras.layers.InputLayer = _CompatInputLayer
+
+        # Register DTypePolicy under all names Keras might look for
+        for alias in ("DTypePolicy", "dtype_policy", "Policy"):
+            try:
+                tf.keras.utils.get_custom_objects()[alias] = _DTypePolicy
+            except Exception:
+                pass
+
+        # Also patch ZeroPadding2D dtype config issue
+        _orig_zp_from_config = tf.keras.layers.ZeroPadding2D.from_config
+
+        @classmethod
+        def _zp_from_config(cls, config):
+            config.pop("dtype", None)
+            config_clean = {k: v for k, v in config.items()
+                            if not isinstance(v, dict) or "class_name" not in v}
+            try:
+                return _orig_zp_from_config.__func__(cls, config)
+            except Exception:
+                return _orig_zp_from_config.__func__(cls, config_clean)
+
+        tf.keras.layers.ZeroPadding2D.from_config = _zp_from_config
+
+        print("✅ Keras compatibility patches applied.")
+    except Exception as e:
+        print(f"⚠ Keras patch warning: {e}")
+
+
+_apply_keras_patches()
+
+# ═══════════════════════════════════════════════════════════
+
 app = FastAPI(title="OcularAI Eye Disease Detection API")
 app.add_middleware(
     CORSMiddleware,
@@ -81,43 +160,6 @@ def load_pkl(filename: str):
         return None
 
 
-# ── h5py JSON config patch ───────────────────────────
-def load_model_via_h5py(model_path: str):
-    """
-    Directly patch the .h5 model config JSON to remove
-    'batch_shape' and 'optional' keys that Keras 3 doesn't understand.
-    This is the most reliable method across all Keras versions.
-    """
-    import h5py, json, re
-
-    with h5py.File(model_path, "r") as f:
-        raw_cfg = f.attrs.get("model_config")
-
-    if raw_cfg is None:
-        raise ValueError("model_config not found in h5 file.")
-
-    cfg_str = raw_cfg if isinstance(raw_cfg, str) else raw_cfg.decode("utf-8")
-
-    # Fix 1: rename batch_shape → shape
-    cfg_str = re.sub(r'"batch_shape"\s*:', '"shape":', cfg_str)
-
-    # Fix 2: remove "optional": true/false
-    cfg_str = re.sub(r',\s*"optional"\s*:\s*(true|false)', '', cfg_str)
-    cfg_str = re.sub(r'"optional"\s*:\s*(true|false)\s*,\s*', '', cfg_str)
-    cfg_str = re.sub(r'"optional"\s*:\s*(true|false)', '', cfg_str)
-
-    model_cfg = json.loads(cfg_str)
-
-    # Rebuild model from patched config
-    model = tf.keras.models.model_from_json(json.dumps(model_cfg))
-
-    # Load weights separately
-    model.load_weights(model_path)
-
-    print("✅ Model loaded via h5py JSON patch.")
-    return model
-
-
 # ── Model loading ────────────────────────────────────
 def load_all_models():
     if _models.get("ready"):
@@ -129,59 +171,79 @@ def load_all_models():
     model_path = download_file("densenet121_finetuned.h5")
     full_model = None
 
-    # Try 1: h5py JSON patch — PRIMARY method, works regardless of Keras version
+    custom_objs = {
+        "InputLayer":    _CompatInputLayer,
+        "DTypePolicy":   _DTypePolicy,
+        "dtype_policy":  _DTypePolicy,
+        "Policy":        _DTypePolicy,
+        "ZeroPadding2D": tf.keras.layers.ZeroPadding2D,
+    }
+
+    # Try 1: load_model with custom_objects (patches already applied globally)
     try:
-        full_model = load_model_via_h5py(model_path)
+        full_model = tf.keras.models.load_model(
+            model_path,
+            custom_objects=custom_objs,
+            compile=False
+        )
+        print("✅ Model loaded (custom_objects).")
     except Exception as e1:
-        print(f"⚠ h5py patch failed: {e1}")
+        print(f"⚠ custom_objects load failed: {e1}")
 
-    # Try 2: Patch InputLayer.__init__ to ignore unknown kwargs
+    # Try 2: h5py — strip ALL problematic keys from config JSON
     if full_model is None:
         try:
-            print("Trying patched InputLayer load...")
-            _orig_init = tf.keras.layers.InputLayer.__init__
+            print("Trying deep h5py JSON strip...")
+            import h5py, json
 
-            def _patched_init(self, *args, **kwargs):
-                kwargs.pop("batch_shape", None)
-                kwargs.pop("optional", None)
-                _orig_init(self, *args, **kwargs)
+            with h5py.File(model_path, "r") as f:
+                raw_cfg = f.attrs.get("model_config")
 
-            tf.keras.layers.InputLayer.__init__ = _patched_init
-            full_model = tf.keras.models.load_model(model_path, compile=False)
-            print("✅ Model loaded (patched InputLayer).")
+            cfg_str = raw_cfg if isinstance(raw_cfg, str) else raw_cfg.decode("utf-8")
+            cfg = json.loads(cfg_str)
+
+            def _clean_config(obj):
+                """Recursively clean layer configs."""
+                if isinstance(obj, dict):
+                    # Fix InputLayer
+                    if obj.get("class_name") == "InputLayer":
+                        c = obj.get("config", {})
+                        shape = c.get("batch_shape", c.get("shape", [None, 224, 224, 3]))
+                        obj["config"] = {
+                            "batch_shape": shape,
+                            "dtype":       c.get("dtype", "float32"),
+                            "sparse":      False,
+                            "ragged":      False,
+                            "name":        c.get("name", "input_layer"),
+                        }
+                    # Fix DTypePolicy inside dtype field
+                    if "dtype" in obj and isinstance(obj["dtype"], dict):
+                        dtype_cfg = obj["dtype"]
+                        if dtype_cfg.get("class_name") in ("DTypePolicy", "Policy"):
+                            inner = dtype_cfg.get("config", {})
+                            obj["dtype"] = inner.get("name", "float32")
+                    return {k: _clean_config(v) for k, v in obj.items()}
+                elif isinstance(obj, list):
+                    return [_clean_config(i) for i in obj]
+                return obj
+
+            cfg = _clean_config(cfg)
+            full_model = tf.keras.models.model_from_json(
+                json.dumps(cfg),
+                custom_objects=custom_objs
+            )
+            full_model.load_weights(model_path)
+            print("✅ Model loaded (deep h5py strip).")
         except Exception as e2:
-            print(f"⚠ Patched InputLayer failed: {e2}")
-            try:
-                tf.keras.layers.InputLayer.__init__ = _orig_init
-            except Exception:
-                pass
+            print(f"⚠ Deep h5py strip failed: {e2}")
 
-    # Try 3: Normal load — works if TF_USE_LEGACY_KERAS=1 took effect
+    # Try 3: normal load (last resort)
     if full_model is None:
         try:
-            print("Trying normal load (legacy keras env)...")
             full_model = tf.keras.models.load_model(model_path, compile=False)
             print("✅ Model loaded (normal).")
         except Exception as e3:
             print(f"⚠ Normal load failed: {e3}")
-
-    # Try 4: custom_objects
-    if full_model is None:
-        try:
-            print("Trying custom_objects load...")
-            import tensorflow.keras.layers as kl
-            custom_objs = {
-                "ZeroPadding2D": kl.ZeroPadding2D,
-                "DTypePolicy":   tf.keras.mixed_precision.Policy,
-            }
-            full_model = tf.keras.models.load_model(
-                model_path,
-                custom_objects=custom_objs,
-                compile=False
-            )
-            print("✅ Model loaded (custom_objects).")
-        except Exception as e4:
-            print(f"⚠ Custom objects load failed: {e4}")
 
     if full_model is None:
         raise RuntimeError("All model load attempts failed. Check logs above.")
@@ -205,7 +267,6 @@ def load_all_models():
     if _models["clf"] is None:
         raise RuntimeError("best_clf.pkl failed to load.")
 
-    # Pipeline detection
     if _models["selector"] is not None:
         _models["pipeline"] = "kbest"
         print("✅ Pipeline: DenseNet[-3](256) → SelectKBest → SVM")
@@ -222,63 +283,39 @@ def load_all_models():
 
 # ── Lightweight Feature Importance (SHAP-style, no KernelExplainer) ──
 def compute_shap(feats_reduced: np.ndarray, pred_class: str) -> list:
-    """
-    Fast lightweight feature importance — no KernelExplainer.
-    - Linear SVM  → exact coef_ weights  (instant)
-    - RBF / other → gradient perturbation on top-30 features (~0.05s)
-    Same output format — frontend কোনো change লাগবে না।
-    """
     try:
-        clf = _models["clf"]
-        cls_idx = CLASS_NAMES.index(pred_class) if pred_class in CLASS_NAMES else 0
-        n_feats = feats_reduced.shape[1]
+        clf      = _models["clf"]
+        cls_idx  = CLASS_NAMES.index(pred_class) if pred_class in CLASS_NAMES else 0
+        n_feats  = feats_reduced.shape[1]
         feats_1d = feats_reduced[0]
 
-        # ── Method 1: Linear SVM → coef_ directly ──────────────────
+        # Linear SVM → coef_ directly
         if hasattr(clf, "coef_"):
             coef = clf.coef_
-            if coef.shape[0] > 1 and cls_idx < coef.shape[0]:
-                sv = coef[cls_idx] * feats_1d
-            else:
-                sv = coef[0] * feats_1d
-
+            sv   = coef[cls_idx] * feats_1d if coef.shape[0] > 1 and cls_idx < coef.shape[0] else coef[0] * feats_1d
             abs_sv  = np.abs(sv)
             top_idx = np.argsort(abs_sv)[::-1][:10]
-            print("✅ Feature importance (coef_ method)")
-            return [
-                {"feature": f"F{int(i)}", "value": round(float(sv[i]), 4), "abs": round(float(abs_sv[i]), 4)}
-                for i in top_idx
-            ]
+            print("✅ Feature importance (coef_)")
+            return [{"feature": f"F{int(i)}", "value": round(float(sv[i]), 4), "abs": round(float(abs_sv[i]), 4)} for i in top_idx]
 
-        # ── Method 2: Non-linear → perturbation on top-30 features ─
-        TOP_N = 30
+        # Non-linear SVM → perturbation on top-30
         base_score = clf.decision_function(feats_reduced)
-        if base_score.ndim > 1:
-            base_val = base_score[0][cls_idx] if base_score.shape[1] > cls_idx else base_score[0][0]
-        else:
-            base_val = float(base_score[0])
+        base_val   = float(base_score[0][cls_idx]) if base_score.ndim > 1 and base_score.shape[1] > cls_idx else float(base_score[0])
+        cands      = np.argsort(np.abs(feats_1d))[::-1][:30]
+        sv         = np.zeros(n_feats)
+        eps        = 1e-2
 
-        candidate_idx = np.argsort(np.abs(feats_1d))[::-1][:TOP_N]
-        sv  = np.zeros(n_feats)
-        eps = 1e-2
-
-        for i in candidate_idx:
-            perturbed        = feats_reduced.copy()
-            perturbed[0][i] += eps
-            new_score        = clf.decision_function(perturbed)
-            if new_score.ndim > 1:
-                new_val = new_score[0][cls_idx] if new_score.shape[1] > cls_idx else new_score[0][0]
-            else:
-                new_val = float(new_score[0])
-            sv[i] = (new_val - base_val) / eps
+        for i in cands:
+            p        = feats_reduced.copy()
+            p[0][i] += eps
+            ns       = clf.decision_function(p)
+            nv       = float(ns[0][cls_idx]) if ns.ndim > 1 and ns.shape[1] > cls_idx else float(ns[0])
+            sv[i]    = (nv - base_val) / eps
 
         abs_sv  = np.abs(sv)
         top_idx = np.argsort(abs_sv)[::-1][:10]
-        print("✅ Feature importance (perturbation method)")
-        return [
-            {"feature": f"F{int(i)}", "value": round(float(sv[i]), 4), "abs": round(float(abs_sv[i]), 4)}
-            for i in top_idx
-        ]
+        print("✅ Feature importance (perturbation)")
+        return [{"feature": f"F{int(i)}", "value": round(float(sv[i]), 4), "abs": round(float(abs_sv[i]), 4)} for i in top_idx]
 
     except Exception as e:
         print(f"⚠ Feature importance error: {e}")
@@ -289,11 +326,10 @@ def compute_shap(feats_reduced: np.ndarray, pred_class: str) -> list:
 def run_prediction(image_bytes: bytes) -> dict:
     load_all_models()
 
-    img  = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    img  = img.resize((224, 224), Image.LANCZOS)
-    arr  = preprocess_input(np.array(img, dtype=np.float32))
-    x    = np.expand_dims(arr, axis=0)
-
+    img   = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    img   = img.resize((224, 224), Image.LANCZOS)
+    arr   = preprocess_input(np.array(img, dtype=np.float32))
+    x     = np.expand_dims(arr, axis=0)
     feats = _models["extractor"].predict(x, verbose=0).reshape(1, -1)
     print(f"Features shape: {feats.shape}")
 
@@ -306,10 +342,7 @@ def run_prediction(image_bytes: bytes) -> dict:
 
     clf      = _models["clf"]
     pred_raw = clf.predict(feats)[0]
-    if isinstance(pred_raw, (int, np.integer)):
-        pred_class = CLASS_NAMES[int(pred_raw)] if int(pred_raw) < len(CLASS_NAMES) else "NORMAL"
-    else:
-        pred_class = str(pred_raw)
+    pred_class = CLASS_NAMES[int(pred_raw)] if isinstance(pred_raw, (int, np.integer)) and int(pred_raw) < len(CLASS_NAMES) else str(pred_raw)
 
     if hasattr(clf, "predict_proba"):
         proba_raw = clf.predict_proba(feats)[0]
@@ -320,7 +353,6 @@ def run_prediction(image_bytes: bytes) -> dict:
                 prob_map[key] = float(p)
         else:
             prob_map = {CLASS_NAMES[i]: float(p) for i, p in enumerate(proba_raw) if i < len(CLASS_NAMES)}
-
         sorted_cls = sorted(prob_map.items(), key=lambda x: x[1], reverse=True)
         top1_class, top1_conf = sorted_cls[0]
         top2_class = sorted_cls[1][0] if len(sorted_cls) > 1 else None
@@ -331,8 +363,8 @@ def run_prediction(image_bytes: bytes) -> dict:
         prob_map = {pred_class: 1.0}
 
     shap_values = compute_shap(feats, top1_class)
-
     info = DISEASE_INFO.get(top1_class, DISEASE_INFO["NORMAL"])
+
     return {
         "disease":              top1_class,
         "confidence":           round(top1_conf, 4),
