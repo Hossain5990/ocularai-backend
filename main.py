@@ -166,15 +166,13 @@ def compute_shap(feats_reduced: np.ndarray, pred_class: str) -> list:
                     print("SHAP: no predict_proba, skipping")
                     return []
                 np.random.seed(42)
-                # 50 rows > n_feats only if n_feats < 50, otherwise use n_feats+5
-                # but keep it small for memory
-                n_bg = min(50, n_feats + 5)
+                # bg must have n_samples > n_features to avoid LassoLarsIC crash
+                # n_feats=256 → n_bg=300 (float32 → 256*300*4 bytes = ~300 KB, safe)
+                n_bg = n_feats + 50
                 bg   = np.random.normal(0, 0.1, size=(n_bg, n_feats)).astype(np.float32)
-                # summarize to k=10 cluster centers via kmeans — tiny RAM
-                bg_summary = shap.kmeans(bg, min(10, n_bg))
-                _shap_cache["explainer"] = shap.KernelExplainer(clf.predict_proba, bg_summary)
+                _shap_cache["explainer"] = shap.KernelExplainer(clf.predict_proba, bg)
                 _shap_cache["type"] = "kernel"
-                print(f"SHAP: KernelExplainer ready (kmeans bg, n_bg={n_bg})")
+                print(f"SHAP: KernelExplainer ready (n_bg={n_bg} > n_feats={n_feats})")
 
             _shap_cache["key"] = cache_key
 
@@ -185,7 +183,8 @@ def compute_shap(feats_reduced: np.ndarray, pred_class: str) -> list:
             shap_vals = explainer.shap_values(feats_reduced)
         else:
             # nsamples="auto" এড়িয়ে fixed integer দাও — LassoLarsIC trigger হয় না
-            shap_vals = explainer.shap_values(feats_reduced, nsamples=100, silent=True)
+            # l1_reg="num_features(10)" — LassoLarsIC bypass করে, fixed 10 features select করে
+            shap_vals = explainer.shap_values(feats_reduced, nsamples=200, l1_reg="num_features(10)", silent=True)
 
         # shap_vals shape normalize
         if isinstance(shap_vals, list):
