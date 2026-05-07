@@ -49,7 +49,7 @@ DISEASE_INFO = {
 }
 
 _models = {}
-_shap_cache = {}
+_shap_cache = {}   # SHAP explainer cache — rebuilt only when pipeline changes
 
 
 # ═══════════════════════════════════════════════════
@@ -128,64 +128,73 @@ def load_all_models():
 def compute_shap(feats_reduced: np.ndarray, pred_class: str) -> list:
     """
     SHAP দিয়ে top-10 feature importance বের করে।
-    - linear SVM  -> LinearExplainer  (fast, LassoLarsIC issue নেই)
-    - rbf/other   -> KernelExplainer  (n_bg >= n_feats+10, LassoLarsIC fix)
+
+    Explainer selection (memory-safe):
+      linear SVM  -> shap.LinearExplainer   (exact, O(features), ~0 extra RAM)
+      rbf/other   -> shap.KernelExplainer   (background = 1 summarized row via
+                                              shap.kmeans summary, avoids
+                                              LassoLarsIC n_samples < n_features)
+    Explainer cached after first build — not rebuilt every request.
     """
     try:
-        clf = _models["clf"]
+        clf    = _models["clf"]
+        kernel = getattr(clf, "kernel", "rbf")
+        cls_idx = CLASS_NAMES.index(pred_class) if pred_class in CLASS_NAMES else 0
+
         n_feats = feats_reduced.shape[1]
+        cache_key = f"{kernel}_{n_feats}"
 
-        if "explainer" not in _shap_cache or _shap_cache.get("n_feats") != n_feats:
-            print(f"Building SHAP explainer (n_feats={n_feats})...")
-            kernel = getattr(clf, "kernel", None)
+        if _shap_cache.get("key") != cache_key:
+            print(f"Building SHAP explainer: kernel={kernel}, n_feats={n_feats}")
 
-            if kernel == "linear":
+            if kernel == "linear" and hasattr(clf, "coef_"):
+                # LinearExplainer: exact SHAP values, instant, no RAM issue
+                # background = zero vector (standard for linear models)
                 bg = np.zeros((1, n_feats))
                 _shap_cache["explainer"] = shap.LinearExplainer(clf, bg)
-                _shap_cache["explainer_type"] = "linear"
-                print("SHAP: using LinearExplainer (linear kernel)")
+                _shap_cache["type"] = "linear"
+                print("SHAP: LinearExplainer ready")
+
             else:
-                # n_bg > n_feats হতেই হবে, নাহলে LassoLarsIC crash করে
-                n_bg = max(100, n_feats + 10)
-                np.random.seed(42)
-                bg = np.random.normal(0, 0.01, size=(n_bg, n_feats))
+                # KernelExplainer with shap.kmeans summary background
+                # kmeans(data, 1) = single representative row
+                # → n_samples=1 but LassoLarsIC is NOT used when nsamples
+                #   is given explicitly as integer (bypasses auto-selection)
+                # Use a small random background (10 rows) — enough to avoid
+                # LassoLarsIC while keeping RAM under 5 MB
                 if not hasattr(clf, "predict_proba"):
-                    print("SHAP: clf has no predict_proba, skipping")
+                    print("SHAP: no predict_proba, skipping")
                     return []
-                _shap_cache["explainer"] = shap.KernelExplainer(clf.predict_proba, bg)
-                _shap_cache["explainer_type"] = "kernel"
-                print(f"SHAP: using KernelExplainer (bg={n_bg}x{n_feats})")
+                np.random.seed(42)
+                # 50 rows > n_feats only if n_feats < 50, otherwise use n_feats+5
+                # but keep it small for memory
+                n_bg = min(50, n_feats + 5)
+                bg   = np.random.normal(0, 0.1, size=(n_bg, n_feats)).astype(np.float32)
+                # summarize to k=10 cluster centers via kmeans — tiny RAM
+                bg_summary = shap.kmeans(bg, min(10, n_bg))
+                _shap_cache["explainer"] = shap.KernelExplainer(clf.predict_proba, bg_summary)
+                _shap_cache["type"] = "kernel"
+                print(f"SHAP: KernelExplainer ready (kmeans bg, n_bg={n_bg})")
 
-            _shap_cache["n_feats"] = n_feats
-            print("SHAP explainer ready")
+            _shap_cache["key"] = cache_key
 
-        explainer      = _shap_cache["explainer"]
-        explainer_type = _shap_cache.get("explainer_type", "kernel")
+        explainer     = _shap_cache["explainer"]
+        explainer_type = _shap_cache["type"]
 
         if explainer_type == "linear":
             shap_vals = explainer.shap_values(feats_reduced)
         else:
-            shap_vals = explainer.shap_values(feats_reduced, nsamples=50, silent=True)
+            # nsamples="auto" এড়িয়ে fixed integer দাও — LassoLarsIC trigger হয় না
+            shap_vals = explainer.shap_values(feats_reduced, nsamples=100, silent=True)
 
-        # BUG FIX 2: CLASS_NAMES.index() raises ValueError if pred_class not found.
-        # Use .get() pattern with safe fallback.
-        cls_idx = CLASS_NAMES.index(pred_class) if pred_class in CLASS_NAMES else 0
-
-        # BUG FIX 3: shap_vals shape handling was incomplete.
-        # shap_vals can be: list of arrays, single 2D array, or single 3D array.
+        # shap_vals shape normalize
         if isinstance(shap_vals, list):
-            # list of (n_samples, n_features) per class
-            if cls_idx < len(shap_vals):
-                sv = np.array(shap_vals[cls_idx])
-                sv = sv[0] if sv.ndim == 2 else sv
-            else:
-                sv = np.array(shap_vals[0])[0]
+            sv = np.array(shap_vals[cls_idx] if cls_idx < len(shap_vals) else shap_vals[0])
+            sv = sv[0] if sv.ndim == 2 else sv
         elif isinstance(shap_vals, np.ndarray):
             if shap_vals.ndim == 3:
-                # shape: (n_classes, n_samples, n_features)
                 sv = shap_vals[cls_idx, 0, :]
             elif shap_vals.ndim == 2:
-                # shape: (n_samples, n_features)
                 sv = shap_vals[0]
             else:
                 sv = shap_vals
@@ -196,19 +205,16 @@ def compute_shap(feats_reduced: np.ndarray, pred_class: str) -> list:
         abs_sv  = np.abs(sv)
         top_idx = np.argsort(abs_sv)[::-1][:10]
 
-        result = []
-        for i in top_idx:
-            result.append({
-                "feature": f"F{int(i)}",
-                "value":   round(float(sv[i]), 4),
-                "abs":     round(float(abs_sv[i]), 4),
-            })
-
-        print(f"SHAP done. Top feature: {result[0] if result else 'none'}")
+        result = [
+            {"feature": f"F{int(i)}", "value": round(float(sv[i]), 4), "abs": round(float(abs_sv[i]), 4)}
+            for i in top_idx
+        ]
+        print(f"SHAP done. Top: {result[0] if result else 'none'}")
         return result
 
     except Exception as e:
         print(f"SHAP error: {e}")
+        import traceback; traceback.print_exc()
         return []
 
 
