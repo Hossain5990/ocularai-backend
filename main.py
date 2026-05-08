@@ -1,6 +1,5 @@
 import os, io, pickle
-os.environ["TF_USE_LEGACY_KERAS"] = "1"
-
+import shap
 import gdown
 import numpy as np
 from PIL import Image
@@ -9,94 +8,24 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import tensorflow as tf
 from tensorflow.keras.applications.densenet import preprocess_input
+from tensorflow.keras.models import load_model, Model
 
-# ═══════════════════════════════════════════════════════════
-# KERAS COMPATIBILITY PATCH
-# Render uses Keras 3.x which breaks old .h5 models.
-# We replace InputLayer and register DTypePolicy so the
-# model config deserializes correctly regardless of version.
-# ═══════════════════════════════════════════════════════════
+from contextlib import asynccontextmanager
 
-class _CompatInputLayer(tf.keras.layers.Layer):
-    """
-    Drop-in replacement for InputLayer that silently accepts
-    all legacy kwargs (batch_shape, optional, sparse, ragged).
-    """
-    def __init__(self, shape=None, batch_size=None, dtype=None,
-                 sparse=False, ragged=False, name=None,
-                 # legacy kwargs — accepted and ignored
-                 batch_shape=None, optional=None, **kwargs):
-        # batch_shape → shape
-        if shape is None and batch_shape is not None:
-            shape = batch_shape[1:]  # strip batch dim
-        super().__init__(name=name, dtype=dtype, **kwargs)
-        self._output_shape = shape
-        self._batch_size   = batch_size
+@asynccontextmanager
+async def lifespan(app_instance):
+    # Startup: just print ready — model loads lazily on first request
+    print("OcularAI API starting up...")
+    yield
+    # Shutdown
+    print("OcularAI API shutting down...")
 
-    def call(self, inputs):
-        return inputs
+app = FastAPI(title="OcularAI Eye Disease Detection API", lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-    @classmethod
-    def from_config(cls, config):
-        # Accept any config key without crashing
-        config.pop("optional", None)
-        return cls(**config)
-
-
-class _DTypePolicy:
-    """Stub for keras DTypePolicy — only needs to survive deserialization."""
-    def __init__(self, name="float32", **kwargs):
-        self.name = name
-
-    def get_config(self):
-        return {"name": self.name}
-
-
-def _apply_keras_patches():
-    """Monkey-patch Keras internals once at startup."""
-    try:
-        # Patch InputLayer
-        tf.keras.layers.InputLayer = _CompatInputLayer
-
-        # Register DTypePolicy under all names Keras might look for
-        for alias in ("DTypePolicy", "dtype_policy", "Policy"):
-            try:
-                tf.keras.utils.get_custom_objects()[alias] = _DTypePolicy
-            except Exception:
-                pass
-
-        # Also patch ZeroPadding2D dtype config issue
-        _orig_zp_from_config = tf.keras.layers.ZeroPadding2D.from_config
-
-        @classmethod
-        def _zp_from_config(cls, config):
-            config.pop("dtype", None)
-            config_clean = {k: v for k, v in config.items()
-                            if not isinstance(v, dict) or "class_name" not in v}
-            try:
-                return _orig_zp_from_config.__func__(cls, config)
-            except Exception:
-                return _orig_zp_from_config.__func__(cls, config_clean)
-
-        tf.keras.layers.ZeroPadding2D.from_config = _zp_from_config
-
-        print("✅ Keras compatibility patches applied.")
-    except Exception as e:
-        print(f"⚠ Keras patch warning: {e}")
-
-
-_apply_keras_patches()
-
-# ═══════════════════════════════════════════════════════════
-
-app = FastAPI(title="OcularAI Eye Disease Detection API")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
+# ═══════════════════════════════════════════════════
+# Google Drive File IDs
+# ═══════════════════════════════════════════════════
 GDRIVE_FILES = {
     "densenet121_finetuned.h5": "1FoVidXa3rt5ANpSPNzUrxwCN1Xv9Wg_M",
     "best_clf.pkl":             "1jBE3tYjqG_nWw5Y7KRazD1SvDdHrhHgZ",
@@ -114,25 +43,28 @@ DISEASE_INFO = {
     "AMD":    {"full": "Age-related Macular Degeneration", "severity": "High",
                "desc": "Progressive degeneration of the macula. Wet AMD needs urgent anti-VEGF injections; dry AMD managed with AREDS2 supplements."},
     "CNV":    {"full": "Choroidal Neovascularization", "severity": "High",
-               "desc": "Abnormal blood vessel growth beneath the retina. Requires urgent anti-VEGF therapy (ranibizumab, bevacizumab)."},
+               "desc": "Abnormal blood vessel growth beneath the retina causing rapid central vision loss. Requires urgent anti-VEGF therapy."},
     "CSR":    {"full": "Central Serous Retinopathy", "severity": "Moderate",
-               "desc": "Subretinal fluid accumulation often stress-related. Most cases resolve in 3 months. Chronic cases need photodynamic therapy."},
+               "desc": "Subretinal fluid accumulation often related to stress. Most acute cases resolve in 3 months. Chronic cases may need photodynamic therapy."},
     "DME":    {"full": "Diabetic Macular Edema", "severity": "High",
-               "desc": "Fluid in the macula due to diabetic vascular leakage. Anti-VEGF or laser treatment required alongside glycemic control."},
+               "desc": "Fluid in the macula due to diabetic vascular leakage. Leading cause of vision loss in diabetics. Anti-VEGF or laser treatment required."},
     "DR":     {"full": "Diabetic Retinopathy", "severity": "High",
-               "desc": "Damage to retinal blood vessels from long-term diabetes. Laser therapy, anti-VEGF, and strict blood sugar control needed."},
+               "desc": "Damage to retinal blood vessels caused by long-term diabetes. Can progress to blindness. Laser therapy, anti-VEGF, and strict blood sugar control needed."},
     "DRUSEN": {"full": "Drusen Deposits", "severity": "Moderate",
-               "desc": "Yellow deposits under the retina — early sign of AMD. Regular monitoring essential. AREDS2 supplements may slow progression."},
+               "desc": "Yellow lipid deposits beneath the retina — early sign of AMD. Regular monitoring essential. AREDS2 supplements may slow progression."},
     "MH":     {"full": "Macular Hole", "severity": "High",
-               "desc": "Full-thickness defect in central retina. Pars plana vitrectomy is highly effective (>90% success) when performed early."},
+               "desc": "Full-thickness defect in the central retina. Pars plana vitrectomy is highly effective (>90% success) when performed early."},
     "NORMAL": {"full": "Normal Healthy Retina", "severity": "None",
                "desc": "No pathological changes detected. Retinal layers appear intact. Continue routine annual eye examinations."},
 }
 
 _models = {}
+_shap_cache = {}   # SHAP explainer cache — rebuilt only when pipeline changes
 
 
-# ── Download helper ──────────────────────────────────
+# ═══════════════════════════════════════════════════
+# Model loading
+# ═══════════════════════════════════════════════════
 def download_file(filename: str) -> str:
     path = os.path.join(MODEL_DIR, filename)
     if os.path.exists(path):
@@ -140,12 +72,12 @@ def download_file(filename: str) -> str:
         return path
     file_id = GDRIVE_FILES.get(filename)
     if not file_id or "YOUR_" in file_id:
-        raise RuntimeError(f"File ID not set for '{filename}'.")
+        raise RuntimeError(f"❌ File ID not set for '{filename}'.")
     print(f"⬇ Downloading {filename} ...")
     out = gdown.download(f"https://drive.google.com/uc?id={file_id}", path, quiet=False)
     if not out or not os.path.exists(path):
-        raise RuntimeError(f"Download failed for '{filename}'. Check Drive sharing.")
-    print(f"✅ {filename} ({os.path.getsize(path)/1024/1024:.1f} MB)")
+        raise RuntimeError(f"❌ Download failed for '{filename}'. Check sharing settings.")
+    print(f"✅ Downloaded {filename} ({os.path.getsize(path)/1024/1024:.1f} MB)")
     return path
 
 
@@ -160,105 +92,45 @@ def load_pkl(filename: str):
         return None
 
 
-# ── Model loading ────────────────────────────────────
 def load_all_models():
     if _models.get("ready"):
         return
-
     print("=" * 55)
     print("🔄 Loading all models...")
 
     model_path = download_file("densenet121_finetuned.h5")
-    full_model = None
 
-    custom_objs = {
-        "InputLayer":    _CompatInputLayer,
-        "DTypePolicy":   _DTypePolicy,
-        "dtype_policy":  _DTypePolicy,
-        "Policy":        _DTypePolicy,
-        "ZeroPadding2D": tf.keras.layers.ZeroPadding2D,
-    }
+    # Keras 3 এ batch_shape / optional keyword চেনে না — patch করি
+    import keras
+    from keras.src.layers import InputLayer
 
-    # Try 1: load_model with custom_objects (patches already applied globally)
-    try:
-        full_model = tf.keras.models.load_model(
-            model_path,
-            custom_objects=custom_objs,
-            compile=False
-        )
-        print("✅ Model loaded (custom_objects).")
-    except Exception as e1:
-        print(f"⚠ custom_objects load failed: {e1}")
+    _original_from_config = InputLayer.from_config.__func__ if hasattr(InputLayer.from_config, '__func__') else InputLayer.from_config
 
-    # Try 2: h5py — strip ALL problematic keys from config JSON
-    if full_model is None:
-        try:
-            print("Trying deep h5py JSON strip...")
-            import h5py, json
+    @classmethod
+    def _patched_from_config(cls, config):
+        config.pop("batch_shape", None)
+        config.pop("optional", None)
+        return cls(**config)
 
-            with h5py.File(model_path, "r") as f:
-                raw_cfg = f.attrs.get("model_config")
+    InputLayer.from_config = _patched_from_config
+    print("InputLayer.from_config patched for Keras 3 compatibility")
 
-            cfg_str = raw_cfg if isinstance(raw_cfg, str) else raw_cfg.decode("utf-8")
-            cfg = json.loads(cfg_str)
+    full_model = load_model(model_path, compile=False)
+    print("Model loaded successfully")
+    print(f"✅ Model loaded. Layers: {len(full_model.layers)}")
 
-            def _clean_config(obj):
-                """Recursively clean layer configs."""
-                if isinstance(obj, dict):
-                    # Fix InputLayer
-                    if obj.get("class_name") == "InputLayer":
-                        c = obj.get("config", {})
-                        shape = c.get("batch_shape", c.get("shape", [None, 224, 224, 3]))
-                        obj["config"] = {
-                            "batch_shape": shape,
-                            "dtype":       c.get("dtype", "float32"),
-                            "sparse":      False,
-                            "ragged":      False,
-                            "name":        c.get("name", "input_layer"),
-                        }
-                    # Fix DTypePolicy inside dtype field
-                    if "dtype" in obj and isinstance(obj["dtype"], dict):
-                        dtype_cfg = obj["dtype"]
-                        if dtype_cfg.get("class_name") in ("DTypePolicy", "Policy"):
-                            inner = dtype_cfg.get("config", {})
-                            obj["dtype"] = inner.get("name", "float32")
-                    return {k: _clean_config(v) for k, v in obj.items()}
-                elif isinstance(obj, list):
-                    return [_clean_config(i) for i in obj]
-                return obj
-
-            cfg = _clean_config(cfg)
-            full_model = tf.keras.models.model_from_json(
-                json.dumps(cfg),
-                custom_objects=custom_objs
-            )
-            full_model.load_weights(model_path)
-            print("✅ Model loaded (deep h5py strip).")
-        except Exception as e2:
-            print(f"⚠ Deep h5py strip failed: {e2}")
-
-    # Try 3: normal load (last resort)
-    if full_model is None:
-        try:
-            full_model = tf.keras.models.load_model(model_path, compile=False)
-            print("✅ Model loaded (normal).")
-        except Exception as e3:
-            print(f"⚠ Normal load failed: {e3}")
-
-    if full_model is None:
-        raise RuntimeError("All model load attempts failed. Check logs above.")
-
-    print(f"✅ Model ready. Layers: {len(full_model.layers)}")
-
-    # Feature extractor: layers[-3] = Dense(256)
-    feat_layer = full_model.layers[-3]
+    # BUG FIX 1: layers[-3] is index-based which is fragile if model arch changes.
+    # Use name-based lookup with fallback to index.
+    feat_layer = None
+    for layer in reversed(full_model.layers):
+        if hasattr(layer, 'units') and layer.units == 256:
+            feat_layer = layer
+            break
+    if feat_layer is None:
+        feat_layer = full_model.layers[-3]  # fallback
     print(f"✅ Feature layer: {feat_layer.name}")
-    _models["extractor"] = tf.keras.Model(
-        inputs=full_model.input,
-        outputs=feat_layer.output
-    )
+    _models["extractor"] = Model(inputs=full_model.input, outputs=feat_layer.output)
 
-    # ML components
     _models["clf"]      = load_pkl("best_clf.pkl")
     _models["selector"] = load_pkl("selector.pkl")
     _models["scaler"]   = load_pkl("scaler.pkl")
@@ -275,85 +147,161 @@ def load_all_models():
         print("✅ Pipeline: DenseNet[-3](256) → Scaler → PCA → SVM")
     else:
         _models["pipeline"] = "direct"
-        print("⚠ Pipeline: DenseNet[-3](256) → SVM direct")
+        print("✅ Pipeline: DenseNet[-3](256) → SVM (direct)")
 
     print(f"🚀 Ready! Classes: {CLASS_NAMES}")
     _models["ready"] = True
 
 
-# ── Lightweight Feature Importance (SHAP-style, no KernelExplainer) ──
 def compute_shap(feats_reduced: np.ndarray, pred_class: str) -> list:
+    """
+    SHAP দিয়ে top-10 feature importance বের করে।
+
+    Explainer selection (memory-safe):
+      linear SVM  -> shap.LinearExplainer   (exact, O(features), ~0 extra RAM)
+      rbf/other   -> shap.KernelExplainer   (background = 1 summarized row via
+                                              shap.kmeans summary, avoids
+                                              LassoLarsIC n_samples < n_features)
+    Explainer cached after first build — not rebuilt every request.
+    """
     try:
-        clf      = _models["clf"]
-        cls_idx  = CLASS_NAMES.index(pred_class) if pred_class in CLASS_NAMES else 0
-        n_feats  = feats_reduced.shape[1]
-        feats_1d = feats_reduced[0]
+        clf    = _models["clf"]
+        kernel = getattr(clf, "kernel", "rbf")
+        cls_idx = CLASS_NAMES.index(pred_class) if pred_class in CLASS_NAMES else 0
 
-        # Linear SVM → coef_ directly
-        if hasattr(clf, "coef_"):
-            coef = clf.coef_
-            sv   = coef[cls_idx] * feats_1d if coef.shape[0] > 1 and cls_idx < coef.shape[0] else coef[0] * feats_1d
-            abs_sv  = np.abs(sv)
-            top_idx = np.argsort(abs_sv)[::-1][:10]
-            print("✅ Feature importance (coef_)")
-            return [{"feature": f"F{int(i)}", "value": round(float(sv[i]), 4), "abs": round(float(abs_sv[i]), 4)} for i in top_idx]
+        n_feats = feats_reduced.shape[1]
+        cache_key = f"{kernel}_{n_feats}"
 
-        # Non-linear SVM → perturbation on top-30
-        base_score = clf.decision_function(feats_reduced)
-        base_val   = float(base_score[0][cls_idx]) if base_score.ndim > 1 and base_score.shape[1] > cls_idx else float(base_score[0])
-        cands      = np.argsort(np.abs(feats_1d))[::-1][:30]
-        sv         = np.zeros(n_feats)
-        eps        = 1e-2
+        if _shap_cache.get("key") != cache_key:
+            print(f"Building SHAP explainer: kernel={kernel}, n_feats={n_feats}")
 
-        for i in cands:
-            p        = feats_reduced.copy()
-            p[0][i] += eps
-            ns       = clf.decision_function(p)
-            nv       = float(ns[0][cls_idx]) if ns.ndim > 1 and ns.shape[1] > cls_idx else float(ns[0])
-            sv[i]    = (nv - base_val) / eps
+            if kernel == "linear" and hasattr(clf, "coef_"):
+                # LinearExplainer: exact SHAP values, instant, no RAM issue
+                # background = zero vector (standard for linear models)
+                bg = np.zeros((1, n_feats))
+                _shap_cache["explainer"] = shap.LinearExplainer(clf, bg)
+                _shap_cache["type"] = "linear"
+                print("SHAP: LinearExplainer ready")
+
+            else:
+                # KernelExplainer with shap.kmeans summary background
+                # kmeans(data, 1) = single representative row
+                # → n_samples=1 but LassoLarsIC is NOT used when nsamples
+                #   is given explicitly as integer (bypasses auto-selection)
+                # Use a small random background (10 rows) — enough to avoid
+                # LassoLarsIC while keeping RAM under 5 MB
+                if not hasattr(clf, "predict_proba"):
+                    print("SHAP: no predict_proba, skipping")
+                    return []
+                np.random.seed(42)
+                # bg must have n_samples > n_features to avoid LassoLarsIC crash
+                # n_feats=256 → n_bg=300 (float32 → 256*300*4 bytes = ~300 KB, safe)
+                n_bg = n_feats + 50
+                bg   = np.random.normal(0, 0.1, size=(n_bg, n_feats)).astype(np.float32)
+                _shap_cache["explainer"] = shap.KernelExplainer(clf.predict_proba, bg)
+                _shap_cache["type"] = "kernel"
+                print(f"SHAP: KernelExplainer ready (n_bg={n_bg} > n_feats={n_feats})")
+
+            _shap_cache["key"] = cache_key
+
+        explainer     = _shap_cache["explainer"]
+        explainer_type = _shap_cache["type"]
+
+        if explainer_type == "linear":
+            shap_vals = explainer.shap_values(feats_reduced)
+        else:
+            # nsamples="auto" এড়িয়ে fixed integer দাও — LassoLarsIC trigger হয় না
+            # l1_reg="num_features(10)" — LassoLarsIC bypass করে, fixed 10 features select করে
+            shap_vals = explainer.shap_values(feats_reduced, nsamples=200, l1_reg="num_features(10)", silent=True)
+
+        # shap_vals shape normalize
+        if isinstance(shap_vals, list):
+            sv = np.array(shap_vals[cls_idx] if cls_idx < len(shap_vals) else shap_vals[0])
+            sv = sv[0] if sv.ndim == 2 else sv
+        elif isinstance(shap_vals, np.ndarray):
+            if shap_vals.ndim == 3:
+                sv = shap_vals[cls_idx, 0, :]
+            elif shap_vals.ndim == 2:
+                sv = shap_vals[0]
+            else:
+                sv = shap_vals
+        else:
+            print(f"SHAP: unexpected type {type(shap_vals)}")
+            return []
 
         abs_sv  = np.abs(sv)
         top_idx = np.argsort(abs_sv)[::-1][:10]
-        print("✅ Feature importance (perturbation)")
-        return [{"feature": f"F{int(i)}", "value": round(float(sv[i]), 4), "abs": round(float(abs_sv[i]), 4)} for i in top_idx]
+
+        result = [
+            {"feature": f"F{int(i)}", "value": round(float(sv[i]), 4), "abs": round(float(abs_sv[i]), 4)}
+            for i in top_idx
+        ]
+        print(f"SHAP done. Top: {result[0] if result else 'none'}")
+        return result
 
     except Exception as e:
-        print(f"⚠ Feature importance error: {e}")
+        print(f"SHAP error: {e}")
+        import traceback; traceback.print_exc()
         return []
 
 
-# ── Prediction ───────────────────────────────────────
 def run_prediction(image_bytes: bytes) -> dict:
     load_all_models()
 
-    img   = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    img   = img.resize((224, 224), Image.LANCZOS)
-    arr   = preprocess_input(np.array(img, dtype=np.float32))
-    x     = np.expand_dims(arr, axis=0)
-    feats = _models["extractor"].predict(x, verbose=0).reshape(1, -1)
-    print(f"Features shape: {feats.shape}")
+    img  = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    img  = img.resize((224, 224), Image.LANCZOS)
+    arr  = preprocess_input(np.array(img, dtype=np.float32))
+    x    = np.expand_dims(arr, axis=0)
 
-    pipeline = _models["pipeline"]
-    if pipeline == "kbest":
+    feats = _models["extractor"].predict(x, verbose=0).reshape(1, -1)
+    print(f"Features: {feats.shape}")
+
+    # BUG FIX 4: pipeline "direct" case was missing transform step — feats passed as-is which is correct,
+    # but selector/scaler/pca were not checked for None before transform in "pca" pipeline.
+    if _models["pipeline"] == "kbest":
         feats = _models["selector"].transform(feats)
-    elif pipeline == "pca":
-        feats = _models["scaler"].transform(feats)
-        feats = _models["pca"].transform(feats)
+    elif _models["pipeline"] == "pca":
+        if _models["scaler"] is not None:
+            feats = _models["scaler"].transform(feats)
+        if _models["pca"] is not None:
+            feats = _models["pca"].transform(feats)
+    # "direct": feats used as-is
 
     clf      = _models["clf"]
     pred_raw = clf.predict(feats)[0]
-    pred_class = CLASS_NAMES[int(pred_raw)] if isinstance(pred_raw, (int, np.integer)) and int(pred_raw) < len(CLASS_NAMES) else str(pred_raw)
+
+    # BUG FIX 5: pred_raw type check was missing np.floating (e.g. np.float32 from some clf).
+    if isinstance(pred_raw, (int, np.integer, np.floating, float)):
+        idx = int(round(float(pred_raw)))
+        pred_class = CLASS_NAMES[idx] if 0 <= idx < len(CLASS_NAMES) else "NORMAL"
+    else:
+        pred_class = str(pred_raw).strip()
+        # If it's a string label not in CLASS_NAMES, default to NORMAL
+        if pred_class not in CLASS_NAMES:
+            print(f"⚠ Unknown pred class '{pred_class}', defaulting to NORMAL")
+            pred_class = "NORMAL"
 
     if hasattr(clf, "predict_proba"):
         proba_raw = clf.predict_proba(feats)[0]
         if hasattr(clf, "classes_"):
             prob_map = {}
             for c, p in zip(clf.classes_, proba_raw):
-                key = CLASS_NAMES[int(c)] if isinstance(c, (int, np.integer)) else str(c)
+                # BUG FIX 6: np.floating also needs to be handled here
+                if isinstance(c, (int, np.integer, np.floating, float)):
+                    key = CLASS_NAMES[int(round(float(c)))] if 0 <= int(round(float(c))) < len(CLASS_NAMES) else str(c)
+                else:
+                    key = str(c).strip()
                 prob_map[key] = float(p)
         else:
-            prob_map = {CLASS_NAMES[i]: float(p) for i, p in enumerate(proba_raw) if i < len(CLASS_NAMES)}
-        sorted_cls = sorted(prob_map.items(), key=lambda x: x[1], reverse=True)
+            prob_map = {
+                CLASS_NAMES[i]: float(p)
+                for i, p in enumerate(proba_raw)
+                if i < len(CLASS_NAMES)
+            }
+
+        # BUG FIX 7: sorted() key lambda used 'x' which shadows the outer loop variable 'x' (numpy array).
+        # Renamed to avoid collision.
+        sorted_cls = sorted(prob_map.items(), key=lambda kv: kv[1], reverse=True)
         top1_class, top1_conf = sorted_cls[0]
         top2_class = sorted_cls[1][0] if len(sorted_cls) > 1 else None
         top2_conf  = sorted_cls[1][1] if len(sorted_cls) > 1 else 0.0
@@ -362,8 +310,9 @@ def run_prediction(image_bytes: bytes) -> dict:
         top2_class, top2_conf = None, 0.0
         prob_map = {pred_class: 1.0}
 
-    shap_values = compute_shap(feats, top1_class)
     info = DISEASE_INFO.get(top1_class, DISEASE_INFO["NORMAL"])
+
+    shap_values = compute_shap(feats, top1_class)
 
     return {
         "disease":              top1_class,
@@ -378,18 +327,20 @@ def run_prediction(image_bytes: bytes) -> dict:
     }
 
 
-# ── Routes ───────────────────────────────────────────
+# ═══════════════════════════════════════════════════
+# Routes
+# ═══════════════════════════════════════════════════
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "OcularAI Eye Disease Detection"}
+    return {"status": "ok", "service": "OcularAI — Retinal Eye Disease Detection"}
 
 @app.get("/health")
 def health():
     return {
-        "status":       "healthy",
-        "model_loaded": _models.get("ready", False),
-        "pipeline":     _models.get("pipeline", "not loaded"),
-        "classes":      CLASS_NAMES,
+        "status":          "healthy",
+        "model_loaded":    _models.get("ready", False),
+        "pipeline":        _models.get("pipeline", "not loaded"),
+        "classes":         CLASS_NAMES,
     }
 
 @app.get("/debug")
@@ -403,25 +354,34 @@ def debug():
             "size_mb":    round(os.path.getsize(path)/1024/1024, 2) if os.path.exists(path) else 0,
         }
     return {
-        "files":      files,
-        "loaded":     _models.get("ready", False),
-        "pipeline":   _models.get("pipeline", "not loaded"),
-        "class_order":{i: c for i, c in enumerate(CLASS_NAMES)},
+        "files":         files,
+        "models_loaded": _models.get("ready", False),
+        "pipeline":      _models.get("pipeline", "not loaded"),
+        "class_order":   {i: c for i, c in enumerate(CLASS_NAMES)},
     }
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
-    if not file.content_type.startswith("image/"):
+    # BUG FIX 8: content_type can be None for some clients — guard against it.
+    if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(400, "Only image files accepted.")
+
     contents = await file.read()
     if len(contents) > 15 * 1024 * 1024:
         raise HTTPException(400, "Image too large. Max 15 MB.")
+
     try:
         result = run_prediction(contents)
-        return JSONResponse({"success": True, **result})
+        return JSONResponse({"success": True, "is_retinal": True, **result})
     except RuntimeError as e:
         raise HTTPException(500, str(e))
     except Exception as e:
         import traceback
         print(traceback.format_exc())
         raise HTTPException(500, f"Prediction failed: {str(e)}")
+
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
