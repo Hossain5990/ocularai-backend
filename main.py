@@ -280,13 +280,15 @@ def load_all_models() -> None:
     print(f"✅ Full model loaded | layers: {len(full_model.layers)}")
 
     # ── 2. Verify layer[-3] is the Dense(256) we expect ──────────────────
-    feat_layer = full_model.layers[-3]
+    # NOTE: TF 2.16+ এ layer.output_shape কাজ করে না (AttributeError)।
+    #       layer.output.shape ব্যবহার করতে হবে — এটা সবসময় কাজ করে।
+    feat_layer   = full_model.layers[-3]
+    feat_shape   = feat_layer.output.shape   # e.g. (None, 256)
+    feat_dim     = int(feat_shape[-1])
     print(
         f"✅ Feature layer  : index=-3  name={feat_layer.name}  "
-        f"output_shape={feat_layer.output_shape}"
+        f"output_shape={feat_shape}"
     )
-    # Safety: if output dim is not 256, warn loudly
-    feat_dim = feat_layer.output_shape[-1]
     if feat_dim != 256:
         print(
             f"⚠ WARNING: Expected 256-dim features at layers[-3], "
