@@ -100,59 +100,89 @@ def load_all_models():
 
     model_path = download_file("densenet121_finetuned.h5")
 
-    # ── Keras 3 compatibility patches ──────────────────────────────
-    # Keras 3 এ পুরনো Keras 2 model load করতে গেলে বেশ কিছু
-    # class/keyword mismatch হয়। সব একসাথে patch করি।
+    # ── Keras 3 → Keras 2 .h5 compatibility: monkey-patch approach ──
+    # The .h5 file was saved with Keras 2. Keras 3 fails on several
+    # config keys. We patch ALL known problem spots before loading.
     import keras
-    import keras.src.layers as _klayers
-    import keras.src.backend.common.variables as _kvars
+    import json
 
-    # Patch 1: InputLayer — batch_shape, optional keyword চেনে না
-    from keras.src.layers import InputLayer
+    # --- Patch 1: InputLayer (batch_shape, optional) ---
+    try:
+        from keras.src.layers.core.input_layer import InputLayer
+    except ImportError:
+        from keras.src.layers import InputLayer
+
     @classmethod
-    def _patched_input_from_config(cls, config):
+    def _fix_input(cls, config):
         config.pop("batch_shape", None)
         config.pop("optional", None)
+        # input_shape → shape rename in Keras 3
+        if "input_shape" in config and "shape" not in config:
+            config["shape"] = config.pop("input_shape")
         return cls(**config)
-    InputLayer.from_config = _patched_input_from_config
-    print("Patch 1: InputLayer.from_config OK")
+    InputLayer.from_config = _fix_input
+    print("Patch 1/4: InputLayer OK")
 
-    # Patch 2: DTypePolicy — Keras 2 model এ dtype dict হিসেবে save হয়
-    # Keras 3 DTypePolicy.from_config এ 'name' key expect করে
+    # --- Patch 2: DTypePolicy ---
     try:
-        from keras.src.dtype_policies import DTypePolicy
-        _orig_dtype_from_config = DTypePolicy.from_config
-        @classmethod
-        def _patched_dtype_from_config(cls, config):
-            if isinstance(config, dict):
-                # config = {'module':..,'class_name':'DTypePolicy','config':{'name':'float32',...}}
-                inner = config.get("config", config)
-                name = inner.get("name", "float32")
-                if "float32" in str(name) or name == "float32":
-                    return cls("float32")
-                return cls(str(name))
-            return cls(str(config))
-        DTypePolicy.from_config = _patched_dtype_from_config
-        print("Patch 2: DTypePolicy.from_config OK")
-    except Exception as ep2:
-        print(f"Patch 2 skipped: {ep2}")
+        from keras.src.dtype_policies.dtype_policy import DTypePolicy
+    except ImportError:
+        try:
+            from keras.src.dtype_policies import DTypePolicy
+        except ImportError:
+            DTypePolicy = None
 
-    # Patch 3: ZeroPadding2D — dtype dict config এ 'data_format' mismatch
+    if DTypePolicy is not None:
+        @classmethod
+        def _fix_dtype(cls, config):
+            if isinstance(config, dict):
+                inner = config.get("config", config)
+                name  = inner.get("name", "float32")
+            else:
+                name = str(config)
+            # strip mixed_float16 → float32 for compat
+            name = name.replace("mixed_float16", "float32")
+            try:
+                return cls(name)
+            except Exception:
+                return cls("float32")
+        DTypePolicy.from_config = _fix_dtype
+        print("Patch 2/4: DTypePolicy OK")
+    else:
+        print("Patch 2/4: DTypePolicy not found, skipping")
+
+    # --- Patch 3: ZeroPadding2D dtype field ---
     try:
         from keras.src.layers.convolutional.zero_padding2d import ZeroPadding2D
-        _orig_zp_from_config = ZeroPadding2D.from_config
+        _orig_zp = ZeroPadding2D.from_config.__func__
         @classmethod
-        def _patched_zp_from_config(cls, config):
+        def _fix_zp(cls, config):
             config.pop("dtype", None)
-            return _orig_zp_from_config.__func__(cls, config)
-        ZeroPadding2D.from_config = _patched_zp_from_config
-        print("Patch 3: ZeroPadding2D.from_config OK")
-    except Exception as ep3:
-        print(f"Patch 3 skipped: {ep3}")
+            return _orig_zp(cls, config)
+        ZeroPadding2D.from_config = _fix_zp
+        print("Patch 3/4: ZeroPadding2D OK")
+    except Exception as e:
+        print(f"Patch 3/4: ZeroPadding2D skipped ({e})")
 
-    print("All Keras 3 patches applied, loading model...")
+    # --- Patch 4: Generic layer from_config — strip dtype dicts ---
+    try:
+        from keras.src.layers.layer import Layer
+        _orig_layer_fc = Layer.from_config.__func__
+        @classmethod
+        def _fix_layer(cls, config):
+            # If dtype is a dict (Keras 2 DTypePolicy serialized), extract name
+            if isinstance(config.get("dtype"), dict):
+                inner = config["dtype"].get("config", {})
+                config["dtype"] = inner.get("name", "float32")
+            return _orig_layer_fc(cls, config)
+        Layer.from_config = _fix_layer
+        print("Patch 4/4: Layer.from_config dtype-dict OK")
+    except Exception as e:
+        print(f"Patch 4/4: Layer.from_config skipped ({e})")
+
+    print("All patches applied — loading model...")
     full_model = load_model(model_path, compile=False)
-    print("Model loaded successfully")
+    print("✅ Model loaded successfully")
     print(f"✅ Model loaded. Layers: {len(full_model.layers)}")
 
     # BUG FIX 1: layers[-3] is index-based which is fragile if model arch changes.
