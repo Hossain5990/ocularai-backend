@@ -100,21 +100,57 @@ def load_all_models():
 
     model_path = download_file("densenet121_finetuned.h5")
 
-    # Keras 3 এ batch_shape / optional keyword চেনে না — patch করি
+    # ── Keras 3 compatibility patches ──────────────────────────────
+    # Keras 3 এ পুরনো Keras 2 model load করতে গেলে বেশ কিছু
+    # class/keyword mismatch হয়। সব একসাথে patch করি।
     import keras
+    import keras.src.layers as _klayers
+    import keras.src.backend.common.variables as _kvars
+
+    # Patch 1: InputLayer — batch_shape, optional keyword চেনে না
     from keras.src.layers import InputLayer
-
-    _original_from_config = InputLayer.from_config.__func__ if hasattr(InputLayer.from_config, '__func__') else InputLayer.from_config
-
     @classmethod
-    def _patched_from_config(cls, config):
+    def _patched_input_from_config(cls, config):
         config.pop("batch_shape", None)
         config.pop("optional", None)
         return cls(**config)
+    InputLayer.from_config = _patched_input_from_config
+    print("Patch 1: InputLayer.from_config OK")
 
-    InputLayer.from_config = _patched_from_config
-    print("InputLayer.from_config patched for Keras 3 compatibility")
+    # Patch 2: DTypePolicy — Keras 2 model এ dtype dict হিসেবে save হয়
+    # Keras 3 DTypePolicy.from_config এ 'name' key expect করে
+    try:
+        from keras.src.dtype_policies import DTypePolicy
+        _orig_dtype_from_config = DTypePolicy.from_config
+        @classmethod
+        def _patched_dtype_from_config(cls, config):
+            if isinstance(config, dict):
+                # config = {'module':..,'class_name':'DTypePolicy','config':{'name':'float32',...}}
+                inner = config.get("config", config)
+                name = inner.get("name", "float32")
+                if "float32" in str(name) or name == "float32":
+                    return cls("float32")
+                return cls(str(name))
+            return cls(str(config))
+        DTypePolicy.from_config = _patched_dtype_from_config
+        print("Patch 2: DTypePolicy.from_config OK")
+    except Exception as ep2:
+        print(f"Patch 2 skipped: {ep2}")
 
+    # Patch 3: ZeroPadding2D — dtype dict config এ 'data_format' mismatch
+    try:
+        from keras.src.layers.convolutional.zero_padding2d import ZeroPadding2D
+        _orig_zp_from_config = ZeroPadding2D.from_config
+        @classmethod
+        def _patched_zp_from_config(cls, config):
+            config.pop("dtype", None)
+            return _orig_zp_from_config.__func__(cls, config)
+        ZeroPadding2D.from_config = _patched_zp_from_config
+        print("Patch 3: ZeroPadding2D.from_config OK")
+    except Exception as ep3:
+        print(f"Patch 3 skipped: {ep3}")
+
+    print("All Keras 3 patches applied, loading model...")
     full_model = load_model(model_path, compile=False)
     print("Model loaded successfully")
     print(f"✅ Model loaded. Layers: {len(full_model.layers)}")
