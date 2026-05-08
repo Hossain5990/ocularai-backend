@@ -544,7 +544,7 @@
 #         print(traceback.format_exc())
 #         raise HTTPException(500, f"Prediction failed: {str(e)}")
 
-import os, io, gc, pickle, base64, httpx, time
+import os, io, gc, pickle, base64, httpx, time, asyncio, threading
 import gdown
 import numpy as np
 from PIL import Image
@@ -1076,6 +1076,31 @@ def root():
     }
 
 
+# ══════════════════════════════════════════════════════
+# Startup — load models in a background thread
+# WHY: Render scans for open port within ~30s of process start.
+#      TF model download+load takes 1-3 min → port scan times out.
+#      Solution: bind port immediately, load models in background.
+#      /predict returns 503 until models are ready.
+# ══════════════════════════════════════════════════════
+def _background_load():
+    try:
+        print("🔄 Background model loading started...")
+        load_all_models()
+    except Exception as e:
+        import traceback
+        print(f"❌ Background model load FAILED: {e}")
+        print(traceback.format_exc())
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Start model loading in background — don't block port binding."""
+    t = threading.Thread(target=_background_load, daemon=True)
+    t.start()
+    print("✅ App started — model loading running in background thread")
+
+
 @app.get("/health")
 def health():
     return {
@@ -1124,6 +1149,16 @@ def debug():
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
+    # ── Model still loading? ──────────────────────────────────────────────
+    if not _models.get("ready"):
+        return JSONResponse(
+            status_code=503,
+            content={
+                "success": False,
+                "message": "Models are still loading, please wait 1-2 minutes and try again.",
+            },
+        )
+
     # ── Validate file type ────────────────────────────────────────────────
     if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(400, "Only image files are accepted.")
